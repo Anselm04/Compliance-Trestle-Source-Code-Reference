@@ -1,0 +1,94 @@
+# -*- mode:python; coding:utf-8 -*-
+
+# Copyright (c) 2020 IBM Corp. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Test for cli module command version."""
+
+import pathlib
+from types import SimpleNamespace
+
+import pytest
+from _pytest.monkeypatch import MonkeyPatch
+
+from tests import test_utils
+from tests.test_utils import execute_command_and_assert
+
+from trestle import __version__
+from trestle.common.err import TrestleError
+from trestle.common.model_utils import ModelUtils
+from trestle.core.commands.version import VersionCmd
+from trestle.oscal import OSCAL_VERSION
+
+
+def test_version(monkeypatch: MonkeyPatch) -> None:
+    """Test version output."""
+    testcmd = 'trestle version'
+    execute_command_and_assert(testcmd, 0, monkeypatch)
+
+
+def test_oscal_obj_version(tmp_trestle_dir: pathlib.Path, monkeypatch: MonkeyPatch, capsys) -> None:
+    """Test OSCAL object version output."""
+    test_utils.setup_for_multi_profile(tmp_trestle_dir, False, True)
+    testcmd = 'trestle version -n test_profile_c -t profile'
+    execute_command_and_assert(testcmd, 0, monkeypatch)
+    output, _ = capsys.readouterr()
+    assert 'Version of OSCAL object of test_profile_c profile is: 2021-01-01' in output
+
+    testcmd = 'trestle version -n test_profile_c'
+    execute_command_and_assert(testcmd, 1, monkeypatch)
+
+    testcmd = 'trestle version -n test_profile_c -t nonexisting'
+    execute_command_and_assert(testcmd, 1, monkeypatch)
+
+    testcmd = 'trestle version'
+    execute_command_and_assert(testcmd, 0, monkeypatch)
+    output, _ = capsys.readouterr()
+    assert f'Trestle version v{__version__} based on OSCAL version {OSCAL_VERSION}' in output
+
+    testcmd = 'trestle version -n complex_cat -t catalog'
+    execute_command_and_assert(testcmd, 0, monkeypatch)
+    output, _ = capsys.readouterr()
+    assert 'Version of OSCAL object of complex_cat catalog is: REPLACE_ME' in output
+
+    comp_name = test_utils.setup_for_component_definition(tmp_trestle_dir, monkeypatch)
+    testcmd = f'trestle version -n {comp_name} -t component-definition'
+    execute_command_and_assert(testcmd, 0, monkeypatch)
+    output, _ = capsys.readouterr()
+    assert f'Version of OSCAL object of {comp_name} component-definition is: 0.21.0' in output
+
+
+def test_oscal_obj_version_missing_metadata_raises_trestle_error(monkeypatch: MonkeyPatch) -> None:
+    """Test OSCAL object version reports a friendly error when metadata is missing."""
+    cmd = VersionCmd()
+
+    def _mock_load_model_for_type(*args, **kwargs):
+        return SimpleNamespace(metadata=None), pathlib.Path('/tmp/missing-metadata.json')
+
+    monkeypatch.setattr(ModelUtils, 'load_model_for_type', _mock_load_model_for_type)
+
+    with pytest.raises(TrestleError, match='Metadata version is missing'):
+        cmd._get_version('catalog', 'missing-metadata', pathlib.Path('/tmp'))
+
+
+def test_oscal_obj_version_missing_metadata_version_raises_trestle_error(monkeypatch: MonkeyPatch) -> None:
+    """Test OSCAL object version reports a friendly error when metadata version is missing."""
+    cmd = VersionCmd()
+
+    def _mock_load_model_for_type(*args, **kwargs):
+        return SimpleNamespace(metadata=SimpleNamespace(version=None)), pathlib.Path('/tmp/missing-version.json')
+
+    monkeypatch.setattr(ModelUtils, 'load_model_for_type', _mock_load_model_for_type)
+
+    with pytest.raises(TrestleError, match='Metadata version is missing'):
+        cmd._get_version('catalog', 'missing-version', pathlib.Path('/tmp'))

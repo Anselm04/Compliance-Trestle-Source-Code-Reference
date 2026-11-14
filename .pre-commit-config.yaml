@@ -1,0 +1,29 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: check-yaml
+        exclude: "tests/data/yaml/bad_simple.yaml"
+      - id: no-commit-to-branch
+        args: [--branch, develop, --branch, main, --pattern, 'v\d+$']
+
+  - repo: local
+    hooks:
+      - id: hatch-fmt
+        name: hatch fmt (ruff format + lint)
+        entry: hatch fmt
+        language: system
+        types: [python]
+        pass_filenames: false
+
+  - repo: https://github.com/executablebooks/mdformat
+    rev: 0.7.17
+    hooks:
+      - id: mdformat
+        exclude: "CHANGELOG.md|docs/contributing/maintainers.md|docs/reference/API|tests/data/author|docs/contributing/index.md|tests/data/jinja_markdown_include|tests/data/jinja_cmd/number_captions_data.md|tests/data/jinja_cmd/number_captions_expected_output.md"
+        additional_dependencies:
+          - mdformat-tables
+          - mdformat-config
+          - mdformat-frontmatter
+          - mdformat-gfm

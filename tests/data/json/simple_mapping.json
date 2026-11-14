@@ -1,0 +1,48 @@
+{
+  "mapping-collection": {
+    "uuid": "A0000000-0000-4000-8000-000000000050",
+    "metadata": {
+      "title": "Trestle test mapping-collection",
+      "last-modified": "2021-01-01T00:00:00.000+00:00",
+      "version": "2021-01-01",
+      "oscal-version": "1.0.4"
+    },
+    "provenance": {
+      "method": "manual",
+      "matching-rationale": "semantic",
+      "status": "draft",
+      "mapping-description": "Simple test mapping collection for trestle validation"
+    },
+    "mappings": [
+      {
+        "uuid": "A0000000-0000-4000-8000-000000000060",
+        "source-resource": {
+          "type": "catalog",
+          "href": "https://foo/bar.json"
+        },
+        "target-resource": {
+          "type": "catalog",
+          "href": "https://dog/cat.json"
+        },
+        "maps": [
+          {
+            "uuid": "A0000000-0000-4000-8000-000000000070",
+            "relationship": "subset-of",
+            "sources": [
+              {
+                "type": "control",
+                "id-ref": "ac-1"
+              }
+            ],
+            "targets": [
+              {
+                "type": "control",
+                "id-ref": "ac-2"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

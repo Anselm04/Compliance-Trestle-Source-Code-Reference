@@ -1,0 +1,1438 @@
+# -*- mode:python; coding:utf-8 -*-
+
+# Copyright (c) 2026 The OSCAL Compass Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Security tests for cache path traversal vulnerabilities."""
+
+import pathlib
+import shutil
+import socket
+import sys
+from typing import List, Tuple
+
+import pytest
+
+import tests.test_utils as test_utils
+
+import trestle.oscal.catalog as cat
+import trestle.oscal.profile as prof
+from trestle.common.err import TrestleError
+from trestle.core import generators as gens
+from trestle.core.crm.ssp_inheritance_api import SSPInheritanceAPI
+from trestle.core.profile_resolver import ProfileResolver
+from trestle.core.remote import cache
+from trestle.core.remote.cache import HTTPSFetcher, SFTPFetcher
+from trestle.core.remote.security import PathSecurityValidator, URLSecurityValidator
+from trestle.core.resolver._import import Import
+
+
+class TestPathValidation:
+    """Test path validation functions."""
+
+    def test_validate_url_path_normal(self) -> None:
+        """Test that normal paths pass validation."""
+        PathSecurityValidator.validate_url_path_for_cache('/normal/path.json')  # Should not raise
+        PathSecurityValidator.validate_url_path_for_cache('/path/to/file.json')  # Should not raise
+        PathSecurityValidator.validate_url_path_for_cache('/data/catalog.json')  # Should not raise
+
+    def test_validate_url_path_blocks_traversal(self) -> None:
+        """Test that paths with .. are blocked."""
+        with pytest.raises(TrestleError, match='Security violation:.*[Pp]ath traversal blocked'):
+            PathSecurityValidator.validate_url_path_for_cache('/../../../etc/passwd')
+
+        with pytest.raises(TrestleError, match='Security violation:.*[Pp]ath traversal blocked'):
+            PathSecurityValidator.validate_url_path_for_cache('/path/../file.json')
+
+        with pytest.raises(TrestleError, match='Security violation:.*[Pp]ath traversal blocked'):
+            PathSecurityValidator.validate_url_path_for_cache('/../file.json')
+
+        with pytest.raises(TrestleError, match='Security violation:.*[Pp]ath traversal blocked'):
+            PathSecurityValidator.validate_url_path_for_cache('/../../../../../../tmp/pwned.json')
+
+
+class TestPathSecurityValidator:
+    """Test path security validation."""
+
+    def test_validate_cache_path_within_cache(self, tmp_path: pathlib.Path) -> None:
+        """Test that valid paths within cache are accepted."""
+        cache_root = tmp_path / '.trestle' / 'cache'
+        cache_root.mkdir(parents=True)
+
+        # Valid path within cache
+        valid_path = cache_root / 'example.com' / 'data' / 'file.json'
+        PathSecurityValidator.validate_cache_path(valid_path, cache_root)  # Should not raise
+
+    def test_validate_cache_path_traversal_blocked(self, tmp_path: pathlib.Path) -> None:
+        """Test that path traversal outside cache is blocked."""
+        cache_root = tmp_path / '.trestle' / 'cache'
+        cache_root.mkdir(parents=True)
+
+        # Attempt to traverse outside cache
+        evil_path = cache_root / '..' / '..' / 'etc' / 'passwd'
+
+        with pytest.raises(TrestleError, match='Security violation.*path traversal blocked'):
+            PathSecurityValidator.validate_cache_path(evil_path, cache_root)
+
+    def test_validate_cache_path_absolute_outside_blocked(self, tmp_path: pathlib.Path) -> None:
+        """Test that absolute paths outside cache are blocked."""
+        cache_root = tmp_path / '.trestle' / 'cache'
+        cache_root.mkdir(parents=True)
+
+        # Absolute path outside cache
+        evil_path = pathlib.Path('/tmp/pwned.json')
+
+        with pytest.raises(TrestleError, match='Security violation.*path traversal blocked'):
+            PathSecurityValidator.validate_cache_path(evil_path, cache_root)
+
+    def test_validate_cache_path_unexpected_error(self, tmp_path: pathlib.Path, monkeypatch) -> None:
+        """Test that unexpected errors during validation are caught and wrapped."""
+        cache_root = tmp_path / '.trestle' / 'cache'
+        cache_root.mkdir(parents=True)
+
+        valid_path = cache_root / 'example.com' / 'file.json'
+
+        # Mock relative_to() to raise an unexpected exception (not ValueError)
+        def mock_relative_to(self, other, *args, **kwargs):
+            # Raise a non-ValueError exception to trigger the generic except block
+            raise RuntimeError('Unexpected filesystem error')
+
+        monkeypatch.setattr(pathlib.Path, 'relative_to', mock_relative_to)
+
+        with pytest.raises(TrestleError, match='Error validating cache path'):
+            PathSecurityValidator.validate_cache_path(valid_path, cache_root)
+
+
+class TestTrestleURIPathValidation:
+    """Test trestle:// URI path validation."""
+
+    def test_validate_trestle_uri_path_normal(self) -> None:
+        """Test that normal trestle:// URI paths pass validation."""
+        PathSecurityValidator.validate_trestle_uri_path('catalogs/nist/catalog.json')
+        PathSecurityValidator.validate_trestle_uri_path('profiles/fedramp/profile.json')
+        PathSecurityValidator.validate_trestle_uri_path('components/mycomp/component.json')
+
+    def test_validate_trestle_uri_path_blocks_traversal(self) -> None:
+        """Test that trestle:// URI paths with .. are blocked."""
+        with pytest.raises(TrestleError, match='Security violation:.*[Pp]ath traversal blocked.*trestle://'):
+            PathSecurityValidator.validate_trestle_uri_path('../../etc/passwd')
+
+        with pytest.raises(TrestleError, match='Security violation:.*[Pp]ath traversal blocked.*trestle://'):
+            PathSecurityValidator.validate_trestle_uri_path('catalogs/../../../etc/shadow')
+
+        with pytest.raises(TrestleError, match='Security violation:.*[Pp]ath traversal blocked.*trestle://'):
+            PathSecurityValidator.validate_trestle_uri_path('../sensitive/file.json')
+
+
+class TestLocalPathValidation:
+    """Test local path validation."""
+
+    def test_validate_local_path_within_workspace(self, tmp_path: pathlib.Path) -> None:
+        """Test that valid paths within trestle workspace are accepted."""
+        trestle_root = tmp_path / 'trestle-workspace'
+        trestle_root.mkdir(parents=True)
+
+        # Valid path within workspace
+        valid_path = trestle_root / 'catalogs' / 'nist' / 'catalog.json'
+        PathSecurityValidator.validate_local_path(valid_path, trestle_root)  # Should not raise
+
+    def test_validate_local_path_traversal_blocked(self, tmp_path: pathlib.Path) -> None:
+        """Test that path traversal outside workspace is blocked."""
+        trestle_root = tmp_path / 'trestle-workspace'
+        trestle_root.mkdir(parents=True)
+
+        # Attempt to traverse outside workspace
+        evil_path = trestle_root / '..' / '..' / 'etc' / 'passwd'
+
+        with pytest.raises(TrestleError, match='Security violation.*[Pp]ath traversal blocked'):
+            PathSecurityValidator.validate_local_path(evil_path, trestle_root)
+
+    def test_validate_local_path_absolute_outside_blocked(self, tmp_path: pathlib.Path) -> None:
+        """Test that absolute paths outside workspace are blocked."""
+        trestle_root = tmp_path / 'trestle-workspace'
+        trestle_root.mkdir(parents=True)
+
+        # Absolute path outside workspace
+        evil_path = pathlib.Path('/tmp/pwned.json')
+
+        with pytest.raises(TrestleError, match='Security violation.*[Pp]ath traversal blocked'):
+            PathSecurityValidator.validate_local_path(evil_path, trestle_root)
+
+    def test_validate_local_path_unexpected_error(self, tmp_path: pathlib.Path, monkeypatch) -> None:
+        """Test that unexpected errors during validation are caught and wrapped."""
+        trestle_root = tmp_path / 'trestle-workspace'
+        trestle_root.mkdir(parents=True)
+
+        valid_path = trestle_root / 'catalogs' / 'file.json'
+
+        # Mock relative_to() to raise an unexpected exception (not ValueError)
+        def mock_relative_to(self, other, *args, **kwargs):
+            raise RuntimeError('Unexpected filesystem error')
+
+        monkeypatch.setattr(pathlib.Path, 'relative_to', mock_relative_to)
+
+        with pytest.raises(TrestleError, match='Error validating local path'):
+            PathSecurityValidator.validate_local_path(valid_path, trestle_root)
+
+
+class TestLocalFilePathValidation:
+    """Test local file path validation with workspace boundaries and sensitive file checks."""
+
+    def test_validate_local_file_path_within_workspace(self, tmp_path: pathlib.Path) -> None:
+        """Test that files within workspace are allowed."""
+        workspace = tmp_path / 'workspace'
+        workspace.mkdir(parents=True)
+
+        file_path = workspace / 'catalogs' / 'catalog.json'
+        PathSecurityValidator.validate_local_file_path(workspace, file_path, allow_outside_workspace=False)
+
+    def test_validate_local_file_path_outside_workspace_blocked(self, tmp_path: pathlib.Path) -> None:
+        """Test that files outside workspace are blocked when allow_outside_workspace=False."""
+        workspace = tmp_path / 'workspace'
+        workspace.mkdir(parents=True)
+
+        outside_file = tmp_path / 'outside.json'
+
+        with pytest.raises(TrestleError, match='Access to files outside the trestle workspace is not allowed'):
+            PathSecurityValidator.validate_local_file_path(workspace, outside_file, allow_outside_workspace=False)
+
+    def test_validate_local_file_path_outside_workspace_allowed(self, tmp_path: pathlib.Path) -> None:
+        """Test that non-sensitive files outside workspace are allowed when allow_outside_workspace=True."""
+        workspace = tmp_path / 'workspace'
+        workspace.mkdir(parents=True)
+
+        # Create a safe file outside workspace
+        outside_file = tmp_path / 'safe_file.json'
+        outside_file.touch()
+
+        # Should not raise
+        PathSecurityValidator.validate_local_file_path(workspace, outside_file, allow_outside_workspace=True)
+
+    @pytest.mark.skipif(sys.platform == 'win32', reason='Unix-specific sensitive paths')
+    def test_validate_local_file_path_blocks_etc_passwd(self, tmp_path: pathlib.Path) -> None:
+        """Test that /etc/passwd is blocked even with allow_outside_workspace=True."""
+        workspace = tmp_path / 'workspace'
+        workspace.mkdir(parents=True)
+
+        passwd_path = pathlib.Path('/etc/passwd')
+
+        with pytest.raises(TrestleError, match='Attempt to access potentially sensitive system file'):
+            PathSecurityValidator.validate_local_file_path(workspace, passwd_path, allow_outside_workspace=True)
+
+    @pytest.mark.skipif(sys.platform == 'win32', reason='Unix-specific sensitive paths')
+    def test_validate_local_file_path_blocks_etc_shadow(self, tmp_path: pathlib.Path) -> None:
+        """Test that /etc/shadow is blocked."""
+        workspace = tmp_path / 'workspace'
+        workspace.mkdir(parents=True)
+
+        shadow_path = pathlib.Path('/etc/shadow')
+
+        with pytest.raises(TrestleError, match='Attempt to access potentially sensitive system file'):
+            PathSecurityValidator.validate_local_file_path(workspace, shadow_path, allow_outside_workspace=True)
+
+    @pytest.mark.skipif(sys.platform == 'win32', reason='Unix-specific sensitive paths')
+    def test_validate_local_file_path_blocks_etc_group(self, tmp_path: pathlib.Path) -> None:
+        """Test that /etc/group is blocked."""
+        workspace = tmp_path / 'workspace'
+        workspace.mkdir(parents=True)
+
+        group_path = pathlib.Path('/etc/group')
+
+        with pytest.raises(TrestleError, match='Attempt to access potentially sensitive system file'):
+            PathSecurityValidator.validate_local_file_path(workspace, group_path, allow_outside_workspace=True)
+
+    @pytest.mark.skipif(sys.platform == 'win32', reason='Unix-specific sensitive paths')
+    def test_validate_local_file_path_blocks_etc_sudoers(self, tmp_path: pathlib.Path) -> None:
+        """Test that /etc/sudoers is blocked."""
+        workspace = tmp_path / 'workspace'
+        workspace.mkdir(parents=True)
+
+        sudoers_path = pathlib.Path('/etc/sudoers')
+
+        with pytest.raises(TrestleError, match='Attempt to access potentially sensitive system file'):
+            PathSecurityValidator.validate_local_file_path(workspace, sudoers_path, allow_outside_workspace=True)
+
+    @pytest.mark.skipif(sys.platform == 'win32', reason='Unix-specific sensitive paths')
+    def test_validate_local_file_path_blocks_ssh_directory(self, tmp_path: pathlib.Path) -> None:
+        """Test that .ssh directory is blocked."""
+        workspace = tmp_path / 'workspace'
+        workspace.mkdir(parents=True)
+
+        ssh_path = pathlib.Path('/home/user/.ssh/id_rsa')
+
+        with pytest.raises(TrestleError, match='Attempt to access potentially sensitive system file'):
+            PathSecurityValidator.validate_local_file_path(workspace, ssh_path, allow_outside_workspace=True)
+
+    @pytest.mark.skipif(sys.platform == 'win32', reason='Unix-specific sensitive paths')
+    def test_validate_local_file_path_blocks_aws_credentials(self, tmp_path: pathlib.Path) -> None:
+        """Test that .aws credentials are blocked."""
+        workspace = tmp_path / 'workspace'
+        workspace.mkdir(parents=True)
+
+        aws_path = pathlib.Path('/home/user/.aws/credentials')
+
+        with pytest.raises(TrestleError, match='Attempt to access potentially sensitive system file'):
+            PathSecurityValidator.validate_local_file_path(workspace, aws_path, allow_outside_workspace=True)
+
+    @pytest.mark.skipif(sys.platform == 'win32', reason='Unix-specific sensitive paths')
+    def test_validate_local_file_path_blocks_docker_config(self, tmp_path: pathlib.Path) -> None:
+        """Test that .docker config is blocked."""
+        workspace = tmp_path / 'workspace'
+        workspace.mkdir(parents=True)
+
+        docker_path = pathlib.Path('/home/user/.docker/config.json')
+
+        with pytest.raises(TrestleError, match='Attempt to access potentially sensitive system file'):
+            PathSecurityValidator.validate_local_file_path(workspace, docker_path, allow_outside_workspace=True)
+
+    @pytest.mark.skipif(sys.platform == 'win32', reason='Unix-specific sensitive paths')
+    def test_validate_local_file_path_blocks_kube_config(self, tmp_path: pathlib.Path) -> None:
+        """Test that .kube config is blocked."""
+        workspace = tmp_path / 'workspace'
+        workspace.mkdir(parents=True)
+
+        kube_path = pathlib.Path('/home/user/.kube/config')
+
+        with pytest.raises(TrestleError, match='Attempt to access potentially sensitive system file'):
+            PathSecurityValidator.validate_local_file_path(workspace, kube_path, allow_outside_workspace=True)
+
+    @pytest.mark.skipif(sys.platform == 'win32', reason='Unix-specific sensitive paths')
+    def test_validate_local_file_path_blocks_proc_environ(self, tmp_path: pathlib.Path) -> None:
+        """Test that /proc/self/environ is blocked."""
+        workspace = tmp_path / 'workspace'
+        workspace.mkdir(parents=True)
+
+        proc_path = pathlib.Path('/proc/self/environ')
+
+        with pytest.raises(TrestleError, match='Attempt to access potentially sensitive system file'):
+            PathSecurityValidator.validate_local_file_path(workspace, proc_path, allow_outside_workspace=True)
+
+    def test_validate_local_file_path_blocks_windows_system32(self, tmp_path: pathlib.Path) -> None:
+        """Test that Windows System32 is blocked."""
+        workspace = tmp_path / 'workspace'
+        workspace.mkdir(parents=True)
+
+        win_path = pathlib.Path('C:\\Windows\\System32\\config\\SAM')
+
+        with pytest.raises(TrestleError, match='Attempt to access potentially sensitive system file'):
+            PathSecurityValidator.validate_local_file_path(workspace, win_path, allow_outside_workspace=True)
+
+    def test_validate_local_file_path_blocks_windows_credentials(self, tmp_path: pathlib.Path) -> None:
+        """Test that Windows credentials are blocked."""
+        workspace = tmp_path / 'workspace'
+        workspace.mkdir(parents=True)
+
+        cred_path = pathlib.Path('C:\\Users\\user\\AppData\\Local\\Microsoft\\Credentials\\secret')
+
+        with pytest.raises(TrestleError, match='Attempt to access potentially sensitive system file'):
+            PathSecurityValidator.validate_local_file_path(workspace, cred_path, allow_outside_workspace=True)
+
+    @pytest.mark.skipif(sys.platform == 'win32', reason='Unix-specific sensitive paths')
+    def test_validate_local_file_path_blocks_var_log(self, tmp_path: pathlib.Path) -> None:
+        """Test that /var/log is blocked."""
+        workspace = tmp_path / 'workspace'
+        workspace.mkdir(parents=True)
+
+        log_path = pathlib.Path('/var/log/auth.log')
+
+        with pytest.raises(TrestleError, match='Attempt to access potentially sensitive system file'):
+            PathSecurityValidator.validate_local_file_path(workspace, log_path, allow_outside_workspace=True)
+
+    @pytest.mark.skipif(sys.platform == 'win32', reason='Unix-specific sensitive paths')
+    def test_validate_local_file_path_blocks_mysql_data(self, tmp_path: pathlib.Path) -> None:
+        """Test that MySQL data directory is blocked."""
+        workspace = tmp_path / 'workspace'
+        workspace.mkdir(parents=True)
+
+        mysql_path = pathlib.Path('/var/lib/mysql/users.MYD')
+
+        with pytest.raises(TrestleError, match='Attempt to access potentially sensitive system file'):
+            PathSecurityValidator.validate_local_file_path(workspace, mysql_path, allow_outside_workspace=True)
+
+    @pytest.mark.skipif(sys.platform == 'win32', reason='Unix-specific sensitive paths')
+    def test_validate_local_file_path_case_insensitive(self, tmp_path: pathlib.Path) -> None:
+        """Test that sensitive path checking is case-insensitive."""
+        workspace = tmp_path / 'workspace'
+        workspace.mkdir(parents=True)
+
+        # Test uppercase variations
+        passwd_upper = pathlib.Path('/ETC/PASSWD')
+
+        with pytest.raises(TrestleError, match='Attempt to access potentially sensitive system file'):
+            PathSecurityValidator.validate_local_file_path(workspace, passwd_upper, allow_outside_workspace=True)
+
+    @pytest.mark.skipif(sys.platform == 'win32', reason='Unix-specific sensitive paths')
+    def test_validate_local_file_path_checks_original_and_resolved(self, tmp_path: pathlib.Path) -> None:
+        """Test that both original and resolved paths are checked for sensitive patterns."""
+        workspace = tmp_path / 'workspace'
+        workspace.mkdir(parents=True)
+
+        # Create a path that might resolve differently
+        # The validator checks both the original string and resolved path
+        sensitive_path = pathlib.Path('/home/user/.ssh/authorized_keys')
+
+        with pytest.raises(TrestleError, match='Attempt to access potentially sensitive system file'):
+            PathSecurityValidator.validate_local_file_path(workspace, sensitive_path, allow_outside_workspace=True)
+
+
+class TestHTTPSFetcherPathTraversal:
+    """Test HTTPSFetcher protection against path traversal attacks."""
+
+    def test_https_fetcher_blocks_path_traversal(self, tmp_path: pathlib.Path) -> None:
+        """Test that HTTPSFetcher blocks path traversal in cache paths."""
+        test_utils.ensure_trestle_config_dir(tmp_path)
+
+        # Malicious URL with path traversal
+        evil_url = 'https://evil.com/../../../../../../../tmp/pwned.json'
+
+        with pytest.raises(TrestleError, match='Security violation:.*[Pp]ath traversal blocked'):
+            HTTPSFetcher(tmp_path, evil_url)
+
+    def test_https_fetcher_allows_normal_paths(self, tmp_path: pathlib.Path) -> None:
+        """Test that HTTPSFetcher allows normal paths without traversal."""
+        test_utils.ensure_trestle_config_dir(tmp_path)
+
+        # Normal URL without traversal
+        normal_url = 'https://example.com/catalogs/nist/catalog.json'
+
+        # Should not raise
+        fetcher = HTTPSFetcher(tmp_path, normal_url)
+
+        # Verify cache path is within cache directory
+        cache_dir = tmp_path / '.trestle' / 'cache'
+        assert str(fetcher._cached_object_path).startswith(str(cache_dir))
+
+    def test_https_fetcher_blocks_embedded_traversal(self, tmp_path: pathlib.Path) -> None:
+        """Test that embedded path traversal sequences are blocked."""
+        test_utils.ensure_trestle_config_dir(tmp_path)
+
+        # URL with embedded traversal should be blocked
+        url = 'https://example.com/path/../data/file.json'
+
+        with pytest.raises(TrestleError, match='Security violation:.*[Pp]ath traversal blocked'):
+            HTTPSFetcher(tmp_path, url)
+
+
+class TestSFTPFetcherPathTraversal:
+    """Test SFTPFetcher protection against path traversal attacks."""
+
+    def test_sftp_fetcher_blocks_path_traversal(self, tmp_path: pathlib.Path) -> None:
+        """Test that SFTPFetcher blocks path traversal in cache paths."""
+        test_utils.ensure_trestle_config_dir(tmp_path)
+
+        # Malicious SFTP URL with path traversal
+        evil_url = 'sftp://evil.com/../../../../../../../tmp/pwned.json'
+
+        with pytest.raises(TrestleError, match='Security violation:.*[Pp]ath traversal blocked'):
+            SFTPFetcher(tmp_path, evil_url)
+
+    def test_sftp_fetcher_allows_normal_paths(self, tmp_path: pathlib.Path) -> None:
+        """Test that SFTPFetcher allows normal paths without traversal."""
+        test_utils.ensure_trestle_config_dir(tmp_path)
+
+        # Normal SFTP URL without traversal
+        normal_url = 'sftp://example.com/data/catalog.json'
+
+        # Should not raise
+        fetcher = SFTPFetcher(tmp_path, normal_url)
+
+        # Verify cache path is within cache directory
+        cache_dir = tmp_path / '.trestle' / 'cache'
+        assert str(fetcher._cached_object_path).startswith(str(cache_dir))
+
+    def test_sftp_fetcher_blocks_embedded_traversal(self, tmp_path: pathlib.Path) -> None:
+        """Test that embedded path traversal sequences are blocked."""
+        test_utils.ensure_trestle_config_dir(tmp_path)
+
+        # SFTP URL with embedded traversal should be blocked
+        url = 'sftp://example.com/path/../data/file.json'
+
+        with pytest.raises(TrestleError, match='Security violation:.*[Pp]ath traversal blocked'):
+            SFTPFetcher(tmp_path, url)
+
+
+class TestRealWorldAttackVectors:
+    """Test real-world attack vectors from the security advisory."""
+
+    def test_attack_vector_cron_injection(self, tmp_path: pathlib.Path) -> None:
+        """Test blocking of cron job injection attack vector."""
+        test_utils.ensure_trestle_config_dir(tmp_path)
+
+        # Attack: Write to /etc/cron.d/backdoor
+        evil_url = 'https://evil.com/../../../../../../../etc/cron.d/backdoor'
+
+        with pytest.raises(TrestleError, match='Security violation:.*[Pp]ath traversal blocked'):
+            HTTPSFetcher(tmp_path, evil_url)
+
+    def test_attack_vector_ssh_keys(self, tmp_path: pathlib.Path) -> None:
+        """Test blocking of SSH authorized_keys injection."""
+        test_utils.ensure_trestle_config_dir(tmp_path)
+
+        # Attack: Write to ~/.ssh/authorized_keys
+        evil_url = 'https://evil.com/../../../../../../../root/.ssh/authorized_keys'
+
+        with pytest.raises(TrestleError, match='Security violation:.*[Pp]ath traversal blocked'):
+            HTTPSFetcher(tmp_path, evil_url)
+
+    def test_attack_vector_tmp_write(self, tmp_path: pathlib.Path) -> None:
+        """Test blocking of arbitrary /tmp file write."""
+        test_utils.ensure_trestle_config_dir(tmp_path)
+
+        # Attack: Write to /tmp/pwned.json
+        evil_url = 'https://evil.com/../../../tmp/pwned.json'
+
+        with pytest.raises(TrestleError, match='Security violation:.*[Pp]ath traversal blocked'):
+            HTTPSFetcher(tmp_path, evil_url)
+
+    def test_attack_vector_config_overwrite(self, tmp_path: pathlib.Path) -> None:
+        """Test blocking of config file overwrite."""
+        test_utils.ensure_trestle_config_dir(tmp_path)
+
+        # Attack: Overwrite nginx config
+        evil_url = 'https://evil.com/../../../../../../../etc/nginx/conf.d/evil.conf'
+
+        with pytest.raises(TrestleError, match='Security violation:.*[Pp]ath traversal blocked'):
+            HTTPSFetcher(tmp_path, evil_url)
+
+    def test_attack_vector_sftp_private_network(self, tmp_path: pathlib.Path) -> None:
+        """Test blocking of SFTP path traversal to system files."""
+        test_utils.ensure_trestle_config_dir(tmp_path)
+
+        # Attack: SFTP to internal host with path traversal
+        evil_url = 'sftp://192.168.1.1/../../../../../../../etc/passwd'
+
+        with pytest.raises(TrestleError, match='Security violation:.*[Pp]ath traversal blocked'):
+            SFTPFetcher(tmp_path, evil_url)
+
+
+def test_https_fetcher_blocks_ssrf_aws_metadata(tmp_path: pathlib.Path) -> None:
+    """Test that HTTPSFetcher blocks AWS metadata endpoint."""
+    test_utils.ensure_trestle_config_dir(tmp_path)
+    with pytest.raises(TrestleError, match='cloud metadata endpoints'):
+        HTTPSFetcher(tmp_path, 'https://169.254.169.254/latest/meta-data/')
+
+
+def test_https_fetcher_blocks_ssrf_gcp_metadata(tmp_path: pathlib.Path) -> None:
+    """Test that HTTPSFetcher blocks GCP metadata endpoint."""
+    test_utils.ensure_trestle_config_dir(tmp_path)
+    with pytest.raises(TrestleError, match='cloud metadata endpoints'):
+        HTTPSFetcher(tmp_path, 'https://metadata.google.internal/computeMetadata/v1/')
+
+
+def test_https_fetcher_blocks_ssrf_localhost(tmp_path: pathlib.Path) -> None:
+    """Test that HTTPSFetcher always blocks localhost (loopback)."""
+    test_utils.ensure_trestle_config_dir(tmp_path)
+    # Loopback is always blocked regardless of TRESTLE_BLOCK_PRIVATE_IPS
+    with pytest.raises(TrestleError, match='127.0.0.0/8'):
+        HTTPSFetcher(tmp_path, 'https://127.0.0.1:8080/')
+
+
+def test_https_fetcher_blocks_ssrf_ipv6_loopback(tmp_path: pathlib.Path) -> None:
+    """Test that HTTPSFetcher always blocks IPv6 loopback."""
+    test_utils.ensure_trestle_config_dir(tmp_path)
+    # IPv6 loopback is always blocked regardless of TRESTLE_BLOCK_PRIVATE_IPS
+    with pytest.raises(TrestleError, match='::1/128'):
+        HTTPSFetcher(tmp_path, 'https://[::1]:8080/')
+
+
+def test_https_fetcher_blocks_link_local_169_254(tmp_path: pathlib.Path) -> None:
+    """Test that HTTPSFetcher always blocks link-local 169.254.x.x addresses."""
+    test_utils.ensure_trestle_config_dir(tmp_path)
+    # Link-local is always blocked (includes metadata endpoints)
+    with pytest.raises(TrestleError, match='169.254.0.0/16'):
+        HTTPSFetcher(tmp_path, 'https://169.254.1.1/some/path')
+
+
+def test_https_fetcher_allows_private_network_10_by_default(tmp_path: pathlib.Path) -> None:
+    """Test that HTTPSFetcher allows 10.x.x.x private network IPs by default."""
+    test_utils.ensure_trestle_config_dir(tmp_path)
+    # RFC 1918 ranges are allowed by default to support private GitLab/internal OSCAL repos
+    # This should not raise an error (though it will fail to connect in tests)
+    try:
+        fetcher = HTTPSFetcher(tmp_path, 'https://10.0.0.1:8500/v1/agent/self')
+        # If we get here, the security validation passed (connection will fail but that's expected)
+        assert fetcher is not None
+    except TrestleError as e:
+        # Should not be a security error about private IPs
+        assert '10.0.0.0/8' not in str(e) or 'TRESTLE_BLOCK_PRIVATE_IPS' in str(e)
+
+
+def test_https_fetcher_blocks_private_network_10_when_configured(tmp_path: pathlib.Path, monkeypatch) -> None:
+    """Test that HTTPSFetcher blocks 10.x.x.x when TRESTLE_BLOCK_PRIVATE_IPS is set."""
+    test_utils.ensure_trestle_config_dir(tmp_path)
+    monkeypatch.setenv('TRESTLE_BLOCK_PRIVATE_IPS', 'true')
+    with pytest.raises(TrestleError, match='10.0.0.0/8'):
+        HTTPSFetcher(tmp_path, 'https://10.0.0.1:8500/v1/agent/self')
+
+
+def test_https_fetcher_allows_private_network_192_by_default(tmp_path: pathlib.Path) -> None:
+    """Test that HTTPSFetcher allows 192.168.x.x private network IPs by default."""
+    test_utils.ensure_trestle_config_dir(tmp_path)
+    try:
+        fetcher = HTTPSFetcher(tmp_path, 'https://192.168.1.1/admin')
+        assert fetcher is not None
+    except TrestleError as e:
+        assert '192.168.0.0/16' not in str(e) or 'TRESTLE_BLOCK_PRIVATE_IPS' in str(e)
+
+
+def test_https_fetcher_blocks_private_network_192_when_configured(tmp_path: pathlib.Path, monkeypatch) -> None:
+    """Test that HTTPSFetcher blocks 192.168.x.x when TRESTLE_BLOCK_PRIVATE_IPS is set."""
+    test_utils.ensure_trestle_config_dir(tmp_path)
+    monkeypatch.setenv('TRESTLE_BLOCK_PRIVATE_IPS', 'true')
+    with pytest.raises(TrestleError, match='192.168.0.0/16'):
+        HTTPSFetcher(tmp_path, 'https://192.168.1.1/admin')
+
+
+def test_https_fetcher_allows_private_network_172_by_default(tmp_path: pathlib.Path) -> None:
+    """Test that HTTPSFetcher allows 172.16-31.x.x private network IPs by default."""
+    test_utils.ensure_trestle_config_dir(tmp_path)
+    try:
+        fetcher = HTTPSFetcher(tmp_path, 'https://172.16.0.1/admin')
+        assert fetcher is not None
+    except TrestleError as e:
+        assert '172.16.0.0/12' not in str(e) or 'TRESTLE_BLOCK_PRIVATE_IPS' in str(e)
+
+
+def test_https_fetcher_blocks_private_network_172_when_configured(tmp_path: pathlib.Path, monkeypatch) -> None:
+    """Test that HTTPSFetcher blocks 172.16-31.x.x when TRESTLE_BLOCK_PRIVATE_IPS is set."""
+    test_utils.ensure_trestle_config_dir(tmp_path)
+    monkeypatch.setenv('TRESTLE_BLOCK_PRIVATE_IPS', 'true')
+    with pytest.raises(TrestleError, match='172.16.0.0/12'):
+        HTTPSFetcher(tmp_path, 'https://172.16.0.1/admin')
+
+
+def test_sftp_fetcher_blocks_ssrf_aws_metadata(tmp_path: pathlib.Path) -> None:
+    """Test that SFTPFetcher blocks AWS metadata endpoint."""
+    test_utils.ensure_trestle_config_dir(tmp_path)
+    with pytest.raises(TrestleError, match='cloud metadata endpoints'):
+        SFTPFetcher(tmp_path, 'sftp://169.254.169.254/latest/meta-data/')
+
+
+def test_sftp_fetcher_blocks_ssrf_localhost(tmp_path: pathlib.Path) -> None:
+    """Test that SFTPFetcher always blocks localhost (loopback)."""
+    test_utils.ensure_trestle_config_dir(tmp_path)
+    # Loopback is always blocked regardless of TRESTLE_BLOCK_PRIVATE_IPS
+    with pytest.raises(TrestleError, match='127.0.0.0/8'):
+        SFTPFetcher(tmp_path, 'sftp://127.0.0.1:22/data/file.json')
+
+
+def test_sftp_fetcher_blocks_link_local_169_254(tmp_path: pathlib.Path) -> None:
+    """Test that SFTPFetcher always blocks link-local 169.254.x.x addresses."""
+    test_utils.ensure_trestle_config_dir(tmp_path)
+    # Link-local is always blocked (includes metadata endpoints)
+    with pytest.raises(TrestleError, match='169.254.0.0/16'):
+        SFTPFetcher(tmp_path, 'sftp://169.254.1.1:22/some/path')
+
+
+def test_https_fetcher_blocks_invalid_scheme_http(tmp_path: pathlib.Path) -> None:
+    """Test that HTTPSFetcher blocks HTTP scheme (only HTTPS allowed)."""
+    test_utils.ensure_trestle_config_dir(tmp_path)
+    with pytest.raises(TrestleError, match='Only HTTPS or SFTP schemes are allowed for remote URLs'):
+        HTTPSFetcher(tmp_path, 'http://example.com/data.json')
+
+
+def test_https_fetcher_blocks_invalid_scheme_ftp(tmp_path: pathlib.Path) -> None:
+    """Test that HTTPSFetcher blocks FTP scheme."""
+    test_utils.ensure_trestle_config_dir(tmp_path)
+    with pytest.raises(TrestleError, match='Only HTTPS or SFTP schemes are allowed for remote URLs'):
+        HTTPSFetcher(tmp_path, 'ftp://example.com/data.json')
+
+
+def test_sftp_fetcher_blocks_invalid_scheme_http(tmp_path: pathlib.Path) -> None:
+    """Test that SFTPFetcher blocks HTTP scheme (only SFTP allowed)."""
+    test_utils.ensure_trestle_config_dir(tmp_path)
+    with pytest.raises(TrestleError, match='Only HTTPS or SFTP schemes are allowed for remote URLs'):
+        SFTPFetcher(tmp_path, 'http://example.com/data.json')
+
+
+def test_url_validator_blocks_invalid_scheme(tmp_path: pathlib.Path) -> None:
+    """Test that URLSecurityValidator blocks invalid schemes."""
+    from trestle.core.remote.security import URLSecurityValidator
+
+    validator = URLSecurityValidator()
+
+    with pytest.raises(TrestleError, match='Only HTTPS or SFTP schemes are allowed for remote URLs'):
+        validator.validate_url('http://example.com/data.json')
+
+    with pytest.raises(TrestleError, match='Only HTTPS or SFTP schemes are allowed for remote URLs'):
+        validator.validate_url('ftp://example.com/data.json')
+
+    with pytest.raises(TrestleError, match='Only HTTPS or SFTP schemes are allowed for remote URLs'):
+        validator.validate_url('gopher://example.com/data')
+
+
+def test_url_validator_handles_dns_resolution_failure(tmp_path: pathlib.Path, monkeypatch) -> None:
+    """Test that URLSecurityValidator handles DNS resolution failures gracefully."""
+    from trestle.core.remote.security import URLSecurityValidator
+
+    # Mock socket.getaddrinfo to return empty list (no IPs resolved)
+    def mock_getaddrinfo(hostname, port):
+        return []  # Empty list - no IPs resolved
+
+    monkeypatch.setattr(socket, 'getaddrinfo', mock_getaddrinfo)
+
+    validator = URLSecurityValidator()
+    with pytest.raises(TrestleError, match='No IP addresses resolved for hostname'):
+        validator.validate_url('https://nonexistent.example.com/data.json')
+
+
+def test_url_validator_with_allowed_domains() -> None:
+    """Test URL validation with domain allowlist."""
+    # Test with allowed domain - should pass
+    validator = URLSecurityValidator(allowed_domains={'example.com', 'test.com'})
+    # This will fail DNS resolution but that's OK - we're testing the domain check happens first
+    try:
+        validator.validate_url('https://example.com/path')
+    except TrestleError as e:
+        # Should fail on DNS resolution, not domain check
+        assert 'not in the allowed domains list' not in str(e)
+
+    # Test with disallowed domain - should fail on domain check
+    validator = URLSecurityValidator(allowed_domains={'example.com'})
+    with pytest.raises(TrestleError, match='not in the allowed domains list'):
+        validator.validate_url('https://other.com/path')
+
+
+def test_url_validator_invalid_ip_address(monkeypatch) -> None:
+    """Test handling of invalid IP address from getaddrinfo."""
+
+    def mock_getaddrinfo(hostname, port):
+        # Return a malformed IP that will trigger ValueError in ipaddress.ip_address()
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('not-an-ip', 0))]
+
+    monkeypatch.setattr(socket, 'getaddrinfo', mock_getaddrinfo)
+
+    validator = URLSecurityValidator()
+    with pytest.raises(TrestleError, match='Invalid IP address'):
+        validator.validate_url('https://example.com/path')
+
+
+@pytest.mark.parametrize('block_private_ips', [False, True])
+@pytest.mark.parametrize('resolved_ip', ['100.100.100.200', '::ffff:100.100.100.200'])
+def test_url_validator_blocks_dns_to_alibaba_metadata(monkeypatch, block_private_ips: bool, resolved_ip: str) -> None:
+    """Test that a hostname resolving to the Alibaba metadata IP (in CGNAT range) is blocked."""
+
+    def mock_getaddrinfo(hostname, port):
+        family = socket.AF_INET6 if ':' in resolved_ip else socket.AF_INET
+        return [(family, socket.SOCK_STREAM, 6, '', (resolved_ip, 443))]
+
+    monkeypatch.setattr(socket, 'getaddrinfo', mock_getaddrinfo)
+
+    validator = URLSecurityValidator(block_private_ips=block_private_ips)
+    with pytest.raises(TrestleError, match=r'100\.100\.100\.200/32'):
+        validator.validate_url('https://attacker.example/p.json')
+
+
+def test_url_validator_allows_other_cgnat_addresses(monkeypatch) -> None:
+    """Test that only the metadata IP is blocked, not the whole CGNAT range."""
+
+    def mock_getaddrinfo(hostname, port):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('100.64.0.1', 443))]
+
+    monkeypatch.setattr(socket, 'getaddrinfo', mock_getaddrinfo)
+
+    URLSecurityValidator().validate_url('https://example.com/p.json')
+
+
+class TestSSRFBypassVulnerabilities:
+    """Test fixes for SSRF bypass vulnerabilities (GHSA-h47f-gmjp-m7rr)."""
+
+    def test_blocks_ipv4_mapped_ipv6_cloud_metadata(self, tmp_path: pathlib.Path, monkeypatch) -> None:
+        """Test that IPv4-mapped IPv6 cloud metadata addresses are blocked."""
+        test_utils.ensure_trestle_config_dir(tmp_path)
+
+        # Mock DNS resolution to return IPv4-mapped IPv6 address
+        def mock_getaddrinfo(hostname, port):
+            # Return ::ffff:169.254.169.254 (IPv4-mapped IPv6 for AWS metadata)
+            return [(socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('::ffff:169.254.169.254', 443, 0, 0))]
+
+        monkeypatch.setattr(socket, 'getaddrinfo', mock_getaddrinfo)
+
+        # Should block IPv4-mapped IPv6 cloud metadata address
+        # The metadata endpoint check catches it first with "cloud metadata endpoints" message
+        with pytest.raises(TrestleError, match='cloud metadata endpoints'):
+            HTTPSFetcher(tmp_path, 'https://[::ffff:169.254.169.254]/latest/meta-data/')
+
+    def test_blocks_ipv4_mapped_ipv6_loopback(self, tmp_path: pathlib.Path, monkeypatch) -> None:
+        """Test that IPv4-mapped IPv6 loopback addresses are blocked."""
+        test_utils.ensure_trestle_config_dir(tmp_path)
+
+        # Mock DNS resolution to return IPv4-mapped IPv6 loopback
+        def mock_getaddrinfo(hostname, port):
+            # Return ::ffff:127.0.0.1 (IPv4-mapped IPv6 for loopback)
+            return [(socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('::ffff:127.0.0.1', 443, 0, 0))]
+
+        monkeypatch.setattr(socket, 'getaddrinfo', mock_getaddrinfo)
+
+        # Should block IPv4-mapped IPv6 loopback
+        with pytest.raises(TrestleError, match='127.0.0.0/8'):
+            HTTPSFetcher(tmp_path, 'https://[::ffff:127.0.0.1]/admin')
+
+    def test_blocks_ipv4_mapped_ipv6_rfc1918(self, tmp_path: pathlib.Path, monkeypatch) -> None:
+        """Test that IPv4-mapped IPv6 RFC 1918 addresses are blocked when configured."""
+        test_utils.ensure_trestle_config_dir(tmp_path)
+        monkeypatch.setenv('TRESTLE_BLOCK_PRIVATE_IPS', 'true')
+
+        # Mock DNS resolution to return IPv4-mapped IPv6 private address
+        def mock_getaddrinfo(hostname, port):
+            # Return ::ffff:10.0.0.1 (IPv4-mapped IPv6 for RFC 1918)
+            return [(socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('::ffff:10.0.0.1', 443, 0, 0))]
+
+        monkeypatch.setattr(socket, 'getaddrinfo', mock_getaddrinfo)
+
+        # Should block IPv4-mapped IPv6 private address when TRESTLE_BLOCK_PRIVATE_IPS is set
+        with pytest.raises(TrestleError, match='10.0.0.0/8'):
+            HTTPSFetcher(tmp_path, 'https://[::ffff:10.0.0.1]/admin')
+
+    def test_blocks_zero_address_ipv4(self, tmp_path: pathlib.Path, monkeypatch) -> None:
+        """Test that 0.0.0.0 is blocked (reaches localhost on Linux)."""
+        test_utils.ensure_trestle_config_dir(tmp_path)
+
+        # Mock DNS resolution to return 0.0.0.0
+        def mock_getaddrinfo(hostname, port):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('0.0.0.0', 443))]
+
+        monkeypatch.setattr(socket, 'getaddrinfo', mock_getaddrinfo)
+
+        # Should block 0.0.0.0
+        with pytest.raises(TrestleError, match='0.0.0.0/8'):
+            HTTPSFetcher(tmp_path, 'https://0.0.0.0/admin')
+
+    def test_blocks_zero_address_ipv6(self, tmp_path: pathlib.Path, monkeypatch) -> None:
+        """Test that :: (IPv6 unspecified) is blocked."""
+        test_utils.ensure_trestle_config_dir(tmp_path)
+
+        # Mock DNS resolution to return ::
+        def mock_getaddrinfo(hostname, port):
+            return [(socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('::', 443, 0, 0))]
+
+        monkeypatch.setattr(socket, 'getaddrinfo', mock_getaddrinfo)
+
+        # Should block ::
+        with pytest.raises(TrestleError, match='::/128'):
+            HTTPSFetcher(tmp_path, 'https://[::]/admin')
+
+    def test_metadata_endpoint_canonicalization(self) -> None:
+        """Test that metadata endpoint check canonicalizes IPv4-mapped IPv6 addresses.
+
+        Note: This test directly calls a private method (_check_metadata_endpoints) to verify
+        the canonicalization logic in isolation. While this creates coupling to implementation
+        details, it's necessary to test this specific security-critical path without requiring
+        full DNS resolution setup.
+        """
+        from trestle.core.remote.security import URLSecurityValidator
+
+        validator = URLSecurityValidator()
+
+        # Test that bracketed IPv4-mapped IPv6 literal is canonicalized and blocked
+        with pytest.raises(TrestleError, match='cloud metadata endpoints'):
+            # This should be canonicalized to 169.254.169.254 and blocked
+            validator._check_metadata_endpoints('::ffff:169.254.169.254')
+
+    def test_canonicalize_ip_method(self) -> None:
+        """Test the _canonicalize_ip method directly."""
+        import ipaddress
+        from trestle.core.remote.security import URLSecurityValidator
+
+        validator = URLSecurityValidator()
+
+        # Test IPv4-mapped IPv6 canonicalization
+        ipv6_mapped = ipaddress.ip_address('::ffff:169.254.169.254')
+        canonical = validator._canonicalize_ip(ipv6_mapped)
+        assert isinstance(canonical, ipaddress.IPv4Address)
+        assert str(canonical) == '169.254.169.254'
+
+        # Test regular IPv6 is unchanged
+        ipv6_regular = ipaddress.ip_address('2001:db8::1')
+        canonical = validator._canonicalize_ip(ipv6_regular)
+        assert isinstance(canonical, ipaddress.IPv6Address)
+        assert str(canonical) == '2001:db8::1'
+
+        # Test IPv4 is unchanged
+        ipv4 = ipaddress.ip_address('192.0.2.1')
+        canonical = validator._canonicalize_ip(ipv4)
+        assert isinstance(canonical, ipaddress.IPv4Address)
+        assert str(canonical) == '192.0.2.1'
+
+    def test_version_check_prevents_type_error(self, tmp_path: pathlib.Path, monkeypatch) -> None:
+        """Test that version checking prevents TypeError when comparing IPv4 and IPv6."""
+        test_utils.ensure_trestle_config_dir(tmp_path)
+
+        # Mock DNS to return both IPv4 and IPv6 addresses
+        def mock_getaddrinfo(hostname, port):
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', 443)),
+                (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('::1', 443, 0, 0)),
+            ]
+
+        monkeypatch.setattr(socket, 'getaddrinfo', mock_getaddrinfo)
+
+        # Should block both without TypeError
+        with pytest.raises(TrestleError, match='127.0.0.0/8|::1/128'):
+            HTTPSFetcher(tmp_path, 'https://localhost/admin')
+
+    def test_sftp_blocks_ipv4_mapped_ipv6_cloud_metadata(self, tmp_path: pathlib.Path, monkeypatch) -> None:
+        """Test that SFTPFetcher also blocks IPv4-mapped IPv6 cloud metadata."""
+        test_utils.ensure_trestle_config_dir(tmp_path)
+
+        # Mock DNS resolution to return IPv4-mapped IPv6 address
+        def mock_getaddrinfo(hostname, port):
+            return [(socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('::ffff:169.254.169.254', 22, 0, 0))]
+
+        monkeypatch.setattr(socket, 'getaddrinfo', mock_getaddrinfo)
+
+        # Should block IPv4-mapped IPv6 cloud metadata address
+        # The metadata endpoint check catches it first with "cloud metadata endpoints" message
+        with pytest.raises(TrestleError, match='cloud metadata endpoints'):
+            SFTPFetcher(tmp_path, 'sftp://[::ffff:169.254.169.254]/data')
+
+    def test_sftp_blocks_zero_address(self, tmp_path: pathlib.Path, monkeypatch) -> None:
+        """Test that SFTPFetcher blocks 0.0.0.0."""
+        test_utils.ensure_trestle_config_dir(tmp_path)
+
+        # Mock DNS resolution to return 0.0.0.0
+        def mock_getaddrinfo(hostname, port):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('0.0.0.0', 22))]
+
+        monkeypatch.setattr(socket, 'getaddrinfo', mock_getaddrinfo)
+
+        # Should block 0.0.0.0
+        with pytest.raises(TrestleError, match='0.0.0.0/8'):
+            SFTPFetcher(tmp_path, 'sftp://0.0.0.0/data')
+
+    def test_sftp_blocks_ipv4_mapped_ipv6_rfc1918(self, tmp_path: pathlib.Path, monkeypatch) -> None:
+        """Test that SFTPFetcher blocks IPv4-mapped IPv6 RFC 1918 addresses when configured.
+
+        This mirrors test_blocks_ipv4_mapped_ipv6_rfc1918 for SFTP to ensure BYPASS-4
+        from the advisory is covered for both HTTPSFetcher and SFTPFetcher.
+        """
+        test_utils.ensure_trestle_config_dir(tmp_path)
+        monkeypatch.setenv('TRESTLE_BLOCK_PRIVATE_IPS', 'true')
+
+        # Mock DNS resolution to return IPv4-mapped IPv6 private address
+        def mock_getaddrinfo(hostname, port):
+            # Return ::ffff:10.0.0.1 (IPv4-mapped IPv6 for RFC 1918)
+            return [(socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('::ffff:10.0.0.1', 22, 0, 0))]
+
+        monkeypatch.setattr(socket, 'getaddrinfo', mock_getaddrinfo)
+
+        # Should block IPv4-mapped IPv6 private address when TRESTLE_BLOCK_PRIVATE_IPS is set
+        with pytest.raises(TrestleError, match='10.0.0.0/8'):
+            SFTPFetcher(tmp_path, 'sftp://[::ffff:10.0.0.1]/data')
+
+    def test_multiple_ipv4_mapped_addresses(self, tmp_path: pathlib.Path, monkeypatch) -> None:
+        """Test handling of multiple IPv4-mapped IPv6 addresses in DNS response."""
+        test_utils.ensure_trestle_config_dir(tmp_path)
+
+        # Mock DNS to return multiple IPv4-mapped IPv6 addresses
+        def mock_getaddrinfo(hostname, port):
+            return [
+                (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('::ffff:169.254.169.254', 443, 0, 0)),
+                (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('::ffff:127.0.0.1', 443, 0, 0)),
+            ]
+
+        monkeypatch.setattr(socket, 'getaddrinfo', mock_getaddrinfo)
+
+        # Should block on first blocked address (169.254.0.0/16)
+        # Using | pattern for robustness - either network match indicates proper blocking
+        with pytest.raises(TrestleError, match='169.254.0.0/16|127.0.0.0/8'):
+            HTTPSFetcher(tmp_path, 'https://evil.example.com/data')
+
+
+class _Redirect302Response:
+    """Minimal response stub that simulates an external host returning a 302 redirect."""
+
+    def __init__(self, location: str) -> None:
+        self.status_code = 302
+        self.headers = {'Location': location}
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class TestHttpsRedirectSsrfBypass:
+    """Regression tests for redirect-based SSRF bypass in HTTPSFetcher.
+
+    Attack chain:
+      1. Attacker supplies an OSCAL profile with import.href = "https://attacker.com/redir"
+      2. attacker.com/redir returns HTTP 302 → http://169.254.169.254/latest/meta-data/...
+      3. Victim runs trestle author profile-resolve (drives Import.process → FetcherFactory →
+         HTTPSFetcher._do_fetch)
+      4. Without the fix: fetcher followed the redirect and wrote IMDS credentials to cache.
+      5. With the fix (allow_redirects=False): fetcher raises TrestleError on the 302 and
+         nothing is written to cache.
+
+    Each test below targets one step of the attack chain.
+    """
+
+    def _mock_attacker_dns(self, monkeypatch) -> None:
+        """Make attacker.com resolve to a benign public IP so URL validation passes."""
+
+        def _getaddrinfo(hostname: str, port) -> List:
+            # 93.184.216.34 is example.com — a real, publicly routable, non-sensitive IP.
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 443))]
+
+        monkeypatch.setattr(socket, 'getaddrinfo', _getaddrinfo)
+
+    def test_redirect_to_link_local_is_rejected_at_fetcher_layer(self, tmp_path: pathlib.Path, monkeypatch) -> None:
+        """HTTPSFetcher rejects a 302 response and does not write anything to cache.
+
+        Verifies the lowest-level fix: allow_redirects=False causes requests.get() to surface
+        the 302 status code, which _do_fetch() then rejects with TrestleError before any data
+        can be written to the cache directory.
+        """
+        test_utils.ensure_trestle_config_dir(tmp_path)
+        self._mock_attacker_dns(monkeypatch)
+
+        redirect_response = _Redirect302Response(
+            'http://169.254.169.254/latest/meta-data/iam/security-credentials/MyRole'
+        )
+        monkeypatch.setattr(cache.requests, 'get', lambda *args, **kwargs: redirect_response)
+
+        fetcher = HTTPSFetcher(tmp_path, 'https://attacker.com/redir')
+        cache_file = fetcher._cached_object_path
+
+        with pytest.raises(TrestleError, match='GET returned code 302'):
+            fetcher._do_fetch()
+
+        # The cache file must not exist — no data was written before the error.
+        assert not cache_file.exists(), 'Cache file written despite 302 redirect — SSRF protection failed'
+
+    def test_redirect_rejected_through_profile_import_chain(self, tmp_path: pathlib.Path, monkeypatch) -> None:
+        """Full chain: Import.process() → FetcherFactory → HTTPSFetcher._do_fetch rejects 302.
+
+        The attacker controls import.href in an OSCAL profile; processing it via the profile
+        resolver pipeline calls FetcherFactory.get_fetcher then fetcher.get_oscal(), which
+        internally calls _do_fetch().  The redirect must be rejected before any bytes reach
+        the cache.  This exercises the entry point at _import.py:104.
+        """
+        test_utils.ensure_trestle_config_dir(tmp_path)
+        self._mock_attacker_dns(monkeypatch)
+
+        redirect_response = _Redirect302Response(
+            'http://169.254.169.254/latest/meta-data/iam/security-credentials/MyRole'
+        )
+        monkeypatch.setattr(cache.requests, 'get', lambda *args, **kwargs: redirect_response)
+
+        # OSCAL profile with import.href pointing at attacker-controlled URL.
+        malicious_import = prof.Import1(href='https://attacker.com/redir', include_all={})
+
+        # process() calls FetcherFactory.get_fetcher then get_oscal().
+        import_filter = Import(trestle_root=tmp_path, import_=malicious_import, uuid_chain=[])
+
+        # The generator is lazy; we must iterate to trigger the fetch.
+        with pytest.raises(TrestleError, match='GET returned code 302'):
+            list(import_filter.process())
+
+        # Confirm nothing was written to cache.
+        cache_dir = tmp_path / '.trestle' / 'cache'
+        written_files = list(cache_dir.rglob('*')) if cache_dir.exists() else []
+        data_files = [f for f in written_files if f.is_file()]
+        assert data_files == [], f'Cache files written despite redirect: {data_files} — SSRF protection failed'
+
+    def test_requests_get_called_with_allow_redirects_false(self, tmp_path: pathlib.Path, monkeypatch) -> None:
+        """requests.get is always called with allow_redirects=False.
+
+        Independently verifies the fix primitive: the keyword argument that prevents redirect
+        following is actually forwarded to the underlying HTTP library on every fetch.
+        """
+        test_utils.ensure_trestle_config_dir(tmp_path)
+        self._mock_attacker_dns(monkeypatch)
+
+        captured: dict = {}
+
+        def _fake_get(url: str, **kwargs) -> _Redirect302Response:
+            captured.update(kwargs)
+            return _Redirect302Response('http://169.254.169.254/latest/meta-data/')
+
+        monkeypatch.setattr(cache.requests, 'get', _fake_get)
+
+        fetcher = HTTPSFetcher(tmp_path, 'https://attacker.com/redir')
+        with pytest.raises(TrestleError, match='GET returned code 302'):
+            fetcher._do_fetch()
+
+        assert captured.get('allow_redirects') is False, (
+            'allow_redirects was not set to False — redirect SSRF bypass is possible'
+        )
+
+
+class TestIPv6TransitionFormSSRFBypass:
+    """Regression tests for CVE-2026-114511 / GHSA-jj4m-34f2-rwc9.
+
+    Verifies that _canonicalize_ip unwraps NAT64, 6to4, Teredo and
+    IPv4-compatible addresses so that the SSRF blocklist is not bypassed.
+    """
+
+    # ------------------------------------------------------------------ helpers
+
+    def _make_validator(self, block_private: bool = True) -> URLSecurityValidator:
+        return URLSecurityValidator(block_private_ips=block_private)
+
+    def _assert_blocked(self, monkeypatch, addr: str, expected_match: str, block_private: bool = True) -> None:
+        """Resolve *addr* from DNS and assert validate_url raises TrestleError."""
+
+        def mock_getaddrinfo(hostname, port):
+            family = socket.AF_INET6 if ':' in addr else socket.AF_INET
+            return [(family, socket.SOCK_STREAM, 6, '', (addr, 443, 0, 0))]
+
+        monkeypatch.setattr(socket, 'getaddrinfo', mock_getaddrinfo)
+        validator = self._make_validator(block_private)
+        with pytest.raises(TrestleError, match=expected_match):
+            validator.validate_url('https://example.com/x')
+
+    # ------------------------------------------------------------------ _canonicalize_ip unit tests
+
+    def test_canonicalize_nat64_loopback(self) -> None:
+        """NAT64 64:ff9b::7f00:1 embeds 127.0.0.1."""
+        import ipaddress as _ip
+
+        v = URLSecurityValidator()
+        result = v._canonicalize_ip(_ip.ip_address('64:ff9b::7f00:1'))
+        assert isinstance(result, _ip.IPv4Address)
+        assert str(result) == '127.0.0.1'
+
+    def test_canonicalize_nat64_metadata(self) -> None:
+        """NAT64 64:ff9b::a9fe:a9fe embeds 169.254.169.254."""
+        import ipaddress as _ip
+
+        v = URLSecurityValidator()
+        result = v._canonicalize_ip(_ip.ip_address('64:ff9b::a9fe:a9fe'))
+        assert isinstance(result, _ip.IPv4Address)
+        assert str(result) == '169.254.169.254'
+
+    def test_canonicalize_nat64_rfc1918(self) -> None:
+        """NAT64 64:ff9b::a00:1 embeds 10.0.0.1."""
+        import ipaddress as _ip
+
+        v = URLSecurityValidator()
+        result = v._canonicalize_ip(_ip.ip_address('64:ff9b::a00:1'))
+        assert isinstance(result, _ip.IPv4Address)
+        assert str(result) == '10.0.0.1'
+
+    def test_canonicalize_nat64_local_use_prefix_64(self) -> None:
+        """Local-use NAT64 64:ff9b:1:0:a:0:100:0 (/64 prefix) embeds 10.0.0.1."""
+        import ipaddress as _ip
+
+        v = URLSecurityValidator()
+        candidates = v._canonicalize_ips(_ip.ip_address('64:ff9b:1:0:a:0:100:0'))
+        candidate_strs = [str(c) for c in candidates]
+        assert '10.0.0.1' in candidate_strs
+
+    def test_canonicalize_nat64_local_use_prefix_48(self) -> None:
+        """Local-use NAT64 64:ff9b:1:a00:0:100:: (/48 prefix) embeds 10.0.0.1."""
+        import ipaddress as _ip
+
+        v = URLSecurityValidator()
+        candidates = v._canonicalize_ips(_ip.ip_address('64:ff9b:1:a00:0:100::'))
+        candidate_strs = [str(c) for c in candidates]
+        assert '10.0.0.1' in candidate_strs
+
+    def test_canonicalize_nat64_local_use_prefix_56(self) -> None:
+        """Local-use NAT64 64:ff9b:1:a:0:1:: (/56 prefix) embeds 10.0.0.1."""
+        import ipaddress as _ip
+
+        v = URLSecurityValidator()
+        candidates = v._canonicalize_ips(_ip.ip_address('64:ff9b:1:a:0:1::'))
+        candidate_strs = [str(c) for c in candidates]
+        assert '10.0.0.1' in candidate_strs
+
+    def test_canonicalize_nat64_local_use_prefix_96(self) -> None:
+        """Local-use NAT64 64:ff9b:1::a00:1 (/96 prefix) embeds 10.0.0.1."""
+        import ipaddress as _ip
+
+        v = URLSecurityValidator()
+        candidates = v._canonicalize_ips(_ip.ip_address('64:ff9b:1::a00:1'))
+        candidate_strs = [str(c) for c in candidates]
+        assert '10.0.0.1' in candidate_strs
+
+    def test_canonicalize_nat64_local_use_nonzero_reserved_bits(self) -> None:
+        """Local-use NAT64 extracts /64 (10.0.0.1) even with non-zero u-octet and suffix bytes."""
+        import ipaddress as _ip
+
+        v = URLSecurityValidator()
+        # 64:ff9b:1:0:10a:0:101:101 has u-octet = 0x01 and suffix = 0x01010101
+        candidates = v._canonicalize_ips(_ip.ip_address('64:ff9b:1:0:10a:0:101:101'))
+        candidate_strs = [str(c) for c in candidates]
+        assert '10.0.0.1' in candidate_strs
+        assert '1.1.1.1' in candidate_strs
+
+    def test_canonicalize_ipv4_compatible_loopback(self) -> None:
+        """IPv4-compatible ::7f00:1 embeds 127.0.0.1."""
+        import ipaddress as _ip
+
+        v = URLSecurityValidator()
+        result = v._canonicalize_ip(_ip.ip_address('::7f00:1'))
+        assert isinstance(result, _ip.IPv4Address)
+        assert str(result) == '127.0.0.1'
+
+    def test_canonicalize_ipv4_compatible_metadata(self) -> None:
+        """IPv4-compatible ::a9fe:a9fe embeds 169.254.169.254."""
+        import ipaddress as _ip
+
+        v = URLSecurityValidator()
+        result = v._canonicalize_ip(_ip.ip_address('::a9fe:a9fe'))
+        assert isinstance(result, _ip.IPv4Address)
+        assert str(result) == '169.254.169.254'
+
+    def test_canonicalize_6to4_loopback(self) -> None:
+        """6to4 2002:7f00:1::1 embeds 127.0.0.1."""
+        import ipaddress as _ip
+
+        v = URLSecurityValidator()
+        result = v._canonicalize_ip(_ip.ip_address('2002:7f00:1::1'))
+        assert isinstance(result, _ip.IPv4Address)
+        assert str(result) == '127.0.0.1'
+
+    def test_canonicalize_6to4_metadata(self) -> None:
+        """6to4 2002:a9fe:a9fe::1 embeds 169.254.169.254."""
+        import ipaddress as _ip
+
+        v = URLSecurityValidator()
+        result = v._canonicalize_ip(_ip.ip_address('2002:a9fe:a9fe::1'))
+        assert isinstance(result, _ip.IPv4Address)
+        assert str(result) == '169.254.169.254'
+
+    def test_canonicalize_teredo_loopback(self) -> None:
+        """Teredo 2001:0:0:0:0:0:80ff:fffe has client 127.0.0.1 (bit-inverted 0x7f000001)."""
+        import ipaddress as _ip
+
+        v = URLSecurityValidator()
+        result = v._canonicalize_ip(_ip.ip_address('2001:0:0:0:0:0:80ff:fffe'))
+        assert isinstance(result, _ip.IPv4Address)
+        assert str(result) == '127.0.0.1'
+
+    def test_canonicalize_teredo_metadata(self) -> None:
+        """Teredo 2001:0:0:0:0:0:5601:5601 has client 169.254.169.254."""
+        import ipaddress as _ip
+
+        v = URLSecurityValidator()
+        result = v._canonicalize_ip(_ip.ip_address('2001:0:0:0:0:0:5601:5601'))
+        assert isinstance(result, _ip.IPv4Address)
+        assert str(result) == '169.254.169.254'
+
+    def test_canonicalize_plain_ipv6_unchanged(self) -> None:
+        """A regular IPv6 address that is not a transition form passes through unchanged."""
+        import ipaddress as _ip
+
+        v = URLSecurityValidator()
+        addr = _ip.ip_address('2001:db8::1')
+        assert v._canonicalize_ip(addr) is addr
+
+    def test_canonicalize_ipv4_unchanged(self) -> None:
+        """An IPv4 address passes through unchanged."""
+        import ipaddress as _ip
+
+        v = URLSecurityValidator()
+        addr = _ip.ip_address('10.0.0.1')
+        assert v._canonicalize_ip(addr) is addr
+
+    # ------------------------------------------------------------------ end-to-end blocklist checks (DNS-level)
+
+    def test_nat64_loopback_blocked_via_dns(self, monkeypatch) -> None:
+        """NAT64 address embedding 127.0.0.1 must be blocked by the SSRF filter."""
+        self._assert_blocked(monkeypatch, '64:ff9b::7f00:1', r'127\.0\.0\.0/8')
+
+    def test_nat64_metadata_blocked_via_dns(self, monkeypatch) -> None:
+        """NAT64 address embedding 169.254.169.254 must be blocked."""
+        self._assert_blocked(monkeypatch, '64:ff9b::a9fe:a9fe', r'169\.254\.0\.0/16')
+
+    def test_nat64_rfc1918_blocked_via_dns(self, monkeypatch) -> None:
+        """NAT64 address embedding 10.0.0.1 must be blocked when block_private_ips=True."""
+        self._assert_blocked(monkeypatch, '64:ff9b::a00:1', r'10\.0\.0\.0/8', block_private=True)
+
+    def test_ipv4_compatible_loopback_blocked_via_dns(self, monkeypatch) -> None:
+        """IPv4-compatible address embedding 127.0.0.1 must be blocked."""
+        self._assert_blocked(monkeypatch, '::7f00:1', r'127\.0\.0\.0/8')
+
+    def test_ipv4_compatible_metadata_blocked_via_dns(self, monkeypatch) -> None:
+        """IPv4-compatible address embedding 169.254.169.254 must be blocked."""
+        self._assert_blocked(monkeypatch, '::a9fe:a9fe', r'169\.254\.0\.0/16')
+
+    def test_6to4_loopback_blocked_via_dns(self, monkeypatch) -> None:
+        """6to4 address embedding 127.0.0.1 must be blocked."""
+        self._assert_blocked(monkeypatch, '2002:7f00:1::1', r'127\.0\.0\.0/8')
+
+    def test_6to4_metadata_blocked_via_dns(self, monkeypatch) -> None:
+        """6to4 address embedding 169.254.169.254 must be blocked."""
+        self._assert_blocked(monkeypatch, '2002:a9fe:a9fe::1', r'169\.254\.0\.0/16')
+
+    def test_teredo_loopback_blocked_via_dns(self, monkeypatch) -> None:
+        """Teredo address with client 127.0.0.1 must be blocked."""
+        self._assert_blocked(monkeypatch, '2001:0:0:0:0:0:80ff:fffe', r'127\.0\.0\.0/8')
+
+    def test_teredo_metadata_blocked_via_dns(self, monkeypatch) -> None:
+        """Teredo address with client 169.254.169.254 must be blocked."""
+        self._assert_blocked(monkeypatch, '2001:0:0:0:0:0:5601:5601', r'169\.254\.0\.0/16')
+
+    def test_nat64_local_use_rfc1918_blocked_via_dns(self, monkeypatch) -> None:
+        """Local-use NAT64 /64 address embedding 10.0.0.1 must be blocked when block_private_ips=True."""
+        self._assert_blocked(monkeypatch, '64:ff9b:1:0:a:0:100:0', r'0\.0\.0\.0/8|10\.0\.0\.0/8', block_private=True)
+
+    def test_nat64_local_use_nonzero_reserved_bits_blocked_via_dns(self, monkeypatch) -> None:
+        """Local-use NAT64 with non-zero reserved bits (64:ff9b:1:0:10a:0:101:101) blocked when block_private_ips=True."""
+        self._assert_blocked(
+            monkeypatch, '64:ff9b:1:0:10a:0:101:101', r'0\.0\.0\.0/8|10\.0\.0\.0/8', block_private=True
+        )
+
+    def test_nat64_local_use_loopback_blocked_via_dns(self, monkeypatch) -> None:
+        """Local-use NAT64 /64 address embedding 127.0.0.1 must be blocked."""
+        self._assert_blocked(monkeypatch, '64:ff9b:1:0:7f:0:100:0', r'0\.0\.0\.0/8|127\.0\.0\.0/8')
+
+    # ------------------------------------------------------------------ URL-literal hostname checks
+
+    def test_nat64_metadata_literal_url_blocked(self) -> None:
+        """https://[64:ff9b::a9fe:a9fe]/x must be caught by _check_metadata_endpoints."""
+        v = URLSecurityValidator()
+        with pytest.raises(TrestleError, match='cloud metadata endpoints'):
+            v._check_metadata_endpoints('64:ff9b::a9fe:a9fe')
+
+    def test_ipv4_compatible_metadata_literal_url_blocked(self) -> None:
+        """IPv4-compatible literal embedding 169.254.169.254 blocked by metadata check."""
+        v = URLSecurityValidator()
+        with pytest.raises(TrestleError, match='cloud metadata endpoints'):
+            v._check_metadata_endpoints('::a9fe:a9fe')
+
+    def test_6to4_metadata_literal_url_blocked(self) -> None:
+        """6to4 literal embedding 169.254.169.254 blocked by metadata check."""
+        v = URLSecurityValidator()
+        with pytest.raises(TrestleError, match='cloud metadata endpoints'):
+            v._check_metadata_endpoints('2002:a9fe:a9fe::1')
+
+    def test_teredo_metadata_literal_url_blocked(self) -> None:
+        """Teredo literal with client 169.254.169.254 blocked by metadata check."""
+        v = URLSecurityValidator()
+        with pytest.raises(TrestleError, match='cloud metadata endpoints'):
+            v._check_metadata_endpoints('2001:0:0:0:0:0:5601:5601')
+
+    def test_nat64_local_use_metadata_literal_url_blocked(self) -> None:
+        """Local-use NAT64 /64 literal embedding 169.254.169.254 blocked by metadata check."""
+        v = URLSecurityValidator()
+        with pytest.raises(TrestleError, match='cloud metadata endpoints'):
+            v._check_metadata_endpoints('64:ff9b:1:0:a9:fea9:fe00:0')
+
+    def test_nat64_local_use_literal_url_blocked_tier2(self) -> None:
+        """https://[64:ff9b:1:0:a:0:100:0]/x blocked when block_private_ips=True."""
+        v = URLSecurityValidator(block_private_ips=True)
+        with pytest.raises(TrestleError, match=r'10\.0\.0\.0/8|0\.0\.0\.0/8'):
+            v.validate_url('https://[64:ff9b:1:0:a:0:100:0]/x')
+
+    def test_nat64_local_use_nonzero_reserved_bits_literal_url_blocked_tier2(self) -> None:
+        """https://[64:ff9b:1:0:10a:0:101:101]/x blocked when block_private_ips=True."""
+        v = URLSecurityValidator(block_private_ips=True)
+        with pytest.raises(TrestleError, match=r'10\.0\.0\.0/8|0\.0\.0\.0/8'):
+            v.validate_url('https://[64:ff9b:1:0:10a:0:101:101]/x')
+
+
+# Made with Bob
+
+
+class TestExternalLocalFileAccess:
+    """Local files outside the workspace may only be read when the path was named directly by the user."""
+
+    @staticmethod
+    def _workspace_and_secret(tmp_path: pathlib.Path) -> Tuple[pathlib.Path, pathlib.Path]:
+        workspace = tmp_path / 'workspace'
+        test_utils.ensure_trestle_config_dir(workspace)
+        secret = tmp_path / '.netrc'
+        secret.write_text('machine example.com login victim password s3cr3t\n')
+        return workspace, secret
+
+    def test_document_reference_to_credential_file_is_blocked(self, tmp_path: pathlib.Path) -> None:
+        """The advisory scenario: a path from within a document must not read a file outside the workspace."""
+        workspace, secret = self._workspace_and_secret(tmp_path)
+        with pytest.raises(TrestleError, match='outside the trestle workspace is not allowed'):
+            cache.FetcherFactory.get_fetcher(workspace, str(secret))
+        with pytest.raises(TrestleError, match='outside the trestle workspace is not allowed'):
+            cache.LocalFetcher(workspace, str(secret))
+
+    def test_document_reference_with_traversal_is_blocked(self, tmp_path: pathlib.Path) -> None:
+        """A relative path climbing out of the workspace is blocked."""
+        workspace, _ = self._workspace_and_secret(tmp_path)
+        (tmp_path / 'outside.json').write_text('{}')
+        with pytest.raises(TrestleError, match='outside the trestle workspace is not allowed'):
+            cache.FetcherFactory.get_fetcher(workspace, '../outside.json')
+
+    def test_document_reference_via_symlink_is_blocked(self, tmp_path: pathlib.Path) -> None:
+        """A symlink inside the workspace pointing outside is blocked, because the resolved path is checked."""
+        workspace, secret = self._workspace_and_secret(tmp_path)
+        link = workspace / 'link.json'
+        try:
+            link.symlink_to(secret)
+        except OSError:
+            pytest.skip('symlinks not supported')
+        with pytest.raises(TrestleError, match='outside the trestle workspace is not allowed'):
+            cache.FetcherFactory.get_fetcher(workspace, str(link))
+
+    def test_document_reference_inside_workspace_is_allowed(self, tmp_path: pathlib.Path) -> None:
+        """A path inside the workspace is allowed."""
+        workspace, _ = self._workspace_and_secret(tmp_path)
+        inside = workspace / 'catalogs' / 'catalog.json'
+        inside.parent.mkdir()
+        inside.write_text('{}')
+        assert isinstance(cache.FetcherFactory.get_fetcher(workspace, str(inside)), cache.LocalFetcher)
+
+    def test_user_named_path_outside_workspace_is_allowed(self, tmp_path: pathlib.Path) -> None:
+        """A path named directly by the user may be outside the workspace."""
+        workspace, _ = self._workspace_and_secret(tmp_path)
+        outside = tmp_path / 'catalog.json'
+        outside.write_text('{}')
+        fetcher = cache.FetcherFactory.get_fetcher(workspace, str(outside), allow_external=True)
+        assert isinstance(fetcher, cache.LocalFetcher)
+
+    def test_profile_import_href_outside_workspace_is_blocked(self, tmp_path: pathlib.Path) -> None:
+        """An imports[].href inside a profile pointing outside the workspace is not read."""
+        workspace, secret = self._workspace_and_secret(tmp_path)
+        with pytest.raises(TrestleError, match='outside the trestle workspace is not allowed'):
+            next(Import(workspace, prof.Import1(href=str(secret), include_all={}), []).process())
+
+    def test_user_named_root_profile_outside_workspace_but_nested_href_blocked(self, tmp_path: pathlib.Path) -> None:
+        """A user-named root profile may be outside the workspace, but the hrefs inside it may not."""
+        workspace, secret = self._workspace_and_secret(tmp_path)
+        outside_profile = tmp_path / 'profile.json'
+        profile = gens.generate_sample_model(prof.Profile)
+        profile.imports = [prof.Import1(href=str(secret), include_all={})]
+        profile.oscal_write(outside_profile)
+
+        # without the flag the root profile itself is rejected
+        with pytest.raises(TrestleError, match='outside the trestle workspace is not allowed'):
+            ProfileResolver.get_resolved_profile_catalog(workspace, str(outside_profile))
+        # with the flag the root is read, but its nested import of the outside file is still rejected
+        with pytest.raises(TrestleError, match='outside the trestle workspace is not allowed') as exc:
+            ProfileResolver.get_resolved_profile_catalog(workspace, str(outside_profile), allow_external=True)
+        assert str(secret) in str(exc.value)
+
+    def test_user_named_root_profile_outside_workspace_resolves(self, tmp_path: pathlib.Path) -> None:
+        """A user-named root profile outside the workspace resolves when its imports are inside the workspace."""
+        workspace, _ = self._workspace_and_secret(tmp_path)
+        inside_cat = workspace / 'catalogs' / 'nist_cat' / 'catalog.json'
+        inside_cat.parent.mkdir(parents=True)
+        shutil.copy(test_utils.JSON_TEST_DATA_PATH / test_utils.SIMPLIFIED_NIST_CATALOG_NAME, inside_cat)
+        outside_profile = tmp_path / 'profile.json'
+        profile = gens.generate_sample_model(prof.Profile)
+        profile.imports = [prof.Import1(href='trestle://catalogs/nist_cat/catalog.json', include_all={})]
+        profile.oscal_write(outside_profile)
+
+        resolved = ProfileResolver.get_resolved_profile_catalog(workspace, str(outside_profile), allow_external=True)
+        assert isinstance(resolved, cat.Catalog)
+
+    def test_leveraged_ssp_reference_from_markdown_must_be_in_workspace(self, tmp_path: pathlib.Path) -> None:
+        """The inheritance API allows a user-named SSP outside the workspace but not one read from markdown."""
+        workspace, secret = self._workspace_and_secret(tmp_path)
+        api = SSPInheritanceAPI(workspace / 'inheritance', workspace)
+        with pytest.raises(TrestleError, match='outside the trestle workspace is not allowed'):
+            api._fetch_leveraged_ssp(str(secret))
+        # allowed by path check when user-named; fails later because the file is not an SSP, not on the path check
+        with pytest.raises(TrestleError) as exc:
+            api._fetch_leveraged_ssp(str(secret), allow_external=True)
+        assert 'outside the trestle workspace' not in str(exc.value)

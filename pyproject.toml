@@ -1,0 +1,379 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "compliance-trestle"
+dynamic = ["version"]
+description = "Tools to manage & autogenerate python objects representing the OSCAL layers/models"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = [
+    "Compliance",
+    "Security",
+    "OSCAL",
+]
+authors = [
+    {name = "OSCAL Compass", email = "oscal-compass-oversight@googlegroups.com"}
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX",
+    "Operating System :: Microsoft",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14"
+]
+dependencies = [
+    "attrs == 26.1.0",
+    "ilcli == 0.3.2",
+    "cryptography == 50.0.2",
+    "paramiko == 5.1.0",
+    "ruamel.yaml == 0.19.1",
+    "furl == 2.1.4",
+    "pydantic[email] == 2.14.3",
+    "python-dotenv == 1.2.4",
+    "python-frontmatter == 1.3.0",
+    "pywin32 == 311; platform_system == 'Windows'",
+    "defusedxml == 0.7.1",
+    "openpyxl == 3.1.5",
+    "Jinja2 == 3.1.6",
+    "cmarkgfm == 2025.10.22",
+    "orjson == 3.13.0",
+    "rfc8785 == 0.1.4",
+    "securesystemslib[crypto] == 1.6.0",
+    "requests == 2.34.2",
+    "importlib_resources == 7.1.0",
+]
+
+[project.optional-dependencies]
+# Fuzzing (Linux only — atheris has no macOS/Windows wheels; 3.0.0 is the latest version supporting Python 3.11)
+fuzz = [
+    "atheris == 3.0.0; sys_platform == 'linux'",
+]
+# Type checking
+typing = [
+    "mypy == 2.4.1",
+    "types-PyYAML == 6.0.12.20261103",
+    "types-paramiko == 5.1.0.20261030",
+    "types-requests == 2.33.0.20261030",
+    "types-setuptools == 84.2.0.20261104",
+]
+# Documentation website
+docs = [
+    "mike == 2.2.0",
+    "mkdocs == 1.6.1",
+    "mkdocs-awesome-pages-plugin == 2.10.1",
+    "mkdocstrings[python] == 1.0.8",
+    "mkdocs-htmlproofer-plugin == 1.6.0",
+    "mkdocs-material == 9.8.1",
+    "mkdocs-minify-plugin == 0.8.0",
+    "mkdocs-git-revision-date-localized-plugin == 1.7.0",
+    "pymdown-extensions == 13.0",
+    "livereload == 2.7.1",
+    "pillow == 13.0.0",
+    "cairosvg == 2.9.1",
+]
+# Development tools (testing via hatch test)
+dev = [
+    "compliance-trestle[typing,docs]",
+    "pre-commit == 4.7.0",
+    "python-semantic-release == 10.7.0",
+    "pylint == 4.1.3",
+    "datamodel-code-generator[http] == 0.91.0",
+    "gitpython == 3.2.1",
+]
+
+[project.urls]
+Homepage = "https://oscal-compass.github.io/compliance-trestle"
+Documentation = "https://oscal-compass.github.io/compliance-trestle"
+"Source code" = "https://github.com/oscal-compass/compliance-trestle"
+
+[project.scripts]
+trestle = "trestle.cli:run"
+
+[tool.hatch.version]
+path = "trestle/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/trestle",
+]
+exclude = [
+    "/tests",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["trestle"]
+
+[tool.hatch.envs.default]
+dependencies = [
+  "coverage[toml] == 7.17.2",
+]
+
+[tool.hatch.envs.default.scripts]
+cov-combine = "coverage combine"
+
+[tool.hatch.envs.hatch-test]
+default-args = ["tests"]
+parallel = true
+randomize = true
+dependencies = [
+    "coverage[toml] == 7.17.2",
+    "pytest == 9.2.0",
+    "pytest-xdist[psutil] == 3.8.0",
+    "pytest-randomly == 5.1.0",
+    "mypy == 2.4.1",
+]
+
+[tool.hatch.envs.hatch-test.scripts]
+run = [
+    "rm -f .coverage .coverage.*",
+    "coverage run -m pytest{env:HATCH_TEST_ARGS:} --dist loadfile {args}",
+]
+run-cov = [
+    "rm -f .coverage .coverage.*",
+    "coverage run -m pytest{env:HATCH_TEST_ARGS:} --dist loadfile {args}",
+]
+cov-combine = "coverage combine"
+cov-report = "coverage report"
+
+[[tool.hatch.envs.hatch-test.matrix]]
+python = ["3.11", "3.12", "3.13", "3.14"]
+
+[tool.hatch.envs.docs]
+features = ["docs"]
+
+[tool.hatch.envs.docs.scripts]
+build = "mkdocs build -c -s"
+serve = "mkdocs serve"
+automation = "python ./scripts/website_automation.py"
+validate = ["automation", "build"]
+
+[tool.hatch.envs.hatch-static-analysis]
+config-path = "none"
+
+[tool.pytest.ini_options]
+minversion = "6.2"
+testpaths = [
+    "tests",
+]
+
+[tool.ruff]
+line-length = 120
+indent-width = 4
+target-version = "py311"
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pyenv",
+    ".pytest_cache",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    ".vscode",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "site-packages",
+    "venv",
+    "trestle/oscal",
+]
+
+[tool.ruff.format]
+quote-style = "single"
+indent-style = "space"
+skip-magic-trailing-comma = true
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "N",      # pep8-naming
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "T20",    # flake8-print
+    "SIM",    # flake8-simplify
+    "S",      # flake8-bandit (security)
+    "RUF",    # ruff-specific rules (incl. RUF100: unused/invalid noqa directives)
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "S101",   # use of assert (common in tests)
+    "S603",   # subprocess call - check for execution of untrusted input
+    "S607",   # starting a process with a partial executable path
+    # FIXME: UP - pyupgrade rules to fix
+    "UP006",  # FIXME: Use `type` instead of `Type` for type annotations (1134 errors)
+    "UP007",  # FIXME: Use `X | Y` for Union types (114 errors)
+    "UP009",  # FIXME: UTF-8 encoding declaration is unnecessary (211 errors)
+    "UP015",  # FIXME: Unnecessary open mode parameters (25 errors)
+    "UP028",  # FIXME: Replace `yield` in `for` loop with `yield from` (6 errors)
+    "UP035",  # FIXME: `typing.X` is deprecated, use `x` instead (208 errors)
+    "UP037",  # FIXME: Remove quotes from type annotation (1 error)
+    "UP039",  # FIXME: Unnecessary parentheses after class definition (43 errors)
+    "UP045",  # FIXME: Use `X | None` for type annotations (112 errors)
+    # FIXME: B - flake8-bugbear rules to fix
+    "B017",   # FIXME: `assertRaises(Exception)` should be considered evil (6 errors)
+    "B904",   # FIXME: Within `except` clause, raise from err or None (82 errors)
+    # FIXME: SIM - flake8-simplify rules to fix
+    "SIM101", # FIXME: Multiple `isinstance` calls, merge into one (2 errors)
+    "SIM102", # FIXME: Use a single `if` instead of nested `if` (22 errors)
+    "SIM103", # FIXME: Return condition directly instead of `if`-`else` (1 error)
+    "SIM105", # FIXME: Use `contextlib.suppress(...)` instead of `try`-`except`-`pass` (4 errors)
+    "SIM108", # FIXME: Use ternary operator instead of `if`-`else` block (30 errors)
+    "SIM115", # FIXME: Use context handler for opening files (18 errors)
+    "SIM118", # FIXME: Use `key in dict` instead of `key in dict.keys()` (67 errors)
+    "SIM201", # FIXME: Use `!=` instead of `not ... ==` (11 errors)
+    "SIM210", # FIXME: Use `bool(...)` instead of `True if ... else False` (3 errors)
+    "SIM300", # FIXME: Yoda conditions are discouraged (29 errors)
+    "SIM910", # FIXME: Use `dict.get(key)` instead of `dict.get(key, None)` (3 errors)
+    # FIXME: E - pycodestyle rules to fix
+    "E721",   # FIXME: Do not compare types, use `isinstance()` (15 errors)
+    # FIXME: W - pycodestyle warnings to fix
+    "W605",   # FIXME: Invalid escape sequence (36 errors)
+    # FIXME: I - isort rules to fix
+    "I001",   # FIXME: Import block is un-sorted or un-formatted (106 errors)
+    # FIXME: N - pep8-naming rules to fix
+    "N804",   # FIXME: First argument of classmethod should be `cls` (1 error)
+    # FIXME: S - flake8-bandit security rules to fix
+    "S110",   # FIXME: `try`-`except`-`pass` detected (4 errors)
+    "S701",   # FIXME: Using jinja2 templates with `autoescape=False` (5 errors)
+    # FIXME: F - Pyflakes rules to fix
+    "F401",   # FIXME: Unused import (7 errors)
+    # FIXME: C4 - flake8-comprehensions rules to fix
+    "C408",   # FIXME: Unnecessary dict/list/tuple call (1 error)
+    # FIXME: RUF - ruff-specific rules to fix incrementally
+    "RUF003", # FIXME: Comment contains ambiguous unicode character (4 errors)
+    "RUF005", # FIXME: Consider iterable unpacking instead of concatenation (5 errors)
+    "RUF010", # FIXME: Use explicit conversion flag (10 errors)
+    "RUF012", # FIXME: Mutable class attribute should use ClassVar (22 errors)
+    "RUF013", # FIXME: PEP 484 prohibits implicit Optional (16 errors)
+    "RUF015", # FIXME: Prefer next() over single element slice (4 errors)
+    "RUF019", # FIXME: Unnecessary key check before dictionary access (1 error)
+    "RUF021", # FIXME: Parenthesize chained and/or expressions (2 errors)
+    "RUF059", # FIXME: Unpacked variable is never used (5 errors)
+    "RUF002", # FIXME: Docstring contains ambiguous en-dash character (7 errors)
+    "RUF043", # FIXME: Pattern passed to match= contains unescaped metacharacters (39 errors)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "S101",   # asserts allowed in tests
+    "S104",   # binding to all interfaces — acceptable in test mocks simulating network addresses
+    "S105",   # possible hardcoded password
+    "S106",   # possible hardcoded password
+    "S108",   # probable insecure usage of temp file
+    "T201",   # print statements allowed in tests
+]
+"scripts/**/*.py" = [
+    "T20",    # print statements allowed in scripts
+]
+# RUF100 false-positive: ruff reports noqa as unused when the rule fires at a different
+# column offset than the noqa token — the suppressions are functionally required.
+"trestle/core/commands/author/jinja.py" = ["RUF100"]
+"trestle/core/remote/cache.py" = ["RUF100"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["trestle"]
+
+# Black config is used by datamodel-codegen when generating OSCAL models.
+# Line-length 500 ensures single-line Field() definitions for consistent
+# body text comparison in oscal_normalize.py.
+[tool.black]
+line-length = 500
+
+[tool.isort]
+line_length = 500
+
+[tool.mypy]
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true
+strict_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_any_generics = true
+check_untyped_defs = true
+no_implicit_reexport = true
+show_error_codes = true
+show_error_context = true
+disallow_untyped_defs = true
+# Disable only the specific error codes needed for dynamic Python patterns
+disable_error_code = ["assignment", "attr-defined"]
+
+[[tool.mypy.overrides]]
+module = "trestle.oscal.*"
+ignore_errors = true
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.coverage.run]
+relative_files = true
+parallel = true
+concurrency = ["thread", "multiprocessing"]
+sigterm = true
+omit = [
+    "*/tmp*/*.j2",
+    "*/tmp*/*.md.j2",
+]
+
+[tool.semantic_release]
+build_command = """
+    python -m pip install build --upgrade
+    python -m build
+"""
+version_variables = ["trestle/__init__.py:__version__"]
+commit_author = "semantic-release <semantic-release>"
+
+[tool.semantic_release.branches.alpha]
+match = "^(feat|fix|perf)/.+"
+prerelease = true
+prerelease_token = "alpha"
+
+[tool.semantic_release.commit_parser_options]
+allowed_tags = ["build", "chore", "ci", "docs", "feat", "fix", "perf", "style", "refactor", "test"]
+minor_tags = ["feat"]
+patch_tags = ["fix", "perf"]
+default_bump_level = 0
+
+[tool.semantic_release.branches.main]
+match = "(main)"
+prerelease_token = "rc"
+prerelease = false
+
+[tool.semantic_release.branches.maintenance]
+match = "^v\\d+$"
+prerelease = false
+
+[tool.semantic_release.remote]
+name = "origin"
+type = "github"
+ignore_token_for_push = false
+insecure = false
+
+[tool.semantic_release.publish]
+dist_glob_patterns = ["dist/*"]

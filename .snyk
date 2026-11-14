@@ -1,0 +1,36 @@
+# Snyk (https://snyk.io) policy file, patches or ignores known vulnerabilities.
+version: v1.25.1
+# ignores vulnerabilities until expiry date; change duration by modifying expiry date
+ignore:
+  'snyk:lic:pip:certifi:MPL-2.0':
+    - '*':
+        reason: 'Approved exception by the CNCF: https://github.com/cncf/foundation/issues/1191'
+        created: 2025-08-12T14:24:35.017Z
+  'snyk:lic:pip:pathspec:MPL-2.0':
+    - '*':
+        reason: 'Approved exception by the CNCF: https://github.com/cncf/foundation/issues/1190'
+        created: 2025-08-12T14:30:53.423Z
+  'snyk:lic:pip:paramiko:LGPL-2.1':
+    - '*':
+        reason: 'Approved exception by the CNCF: https://github.com/cncf/foundation/issues/1108'
+        created: 2025-08-12T14:33:58.233Z
+  'SNYK-PYTHON-ORJSON-15123465':
+    - '*':
+        reason: >
+          Snyk flags orjson in this project. CVE-2025-67221 affects
+          versions <= 3.11.4. This project uses the latest available
+          version of orjson (>=3.11.5), which is not vulnerable.
+          The root cause of the flag is under investigation; this ignore
+          is temporary to allow pipeline progress.
+        expires: 2026-03-28T00:00:00.000Z
+        created: 2026-01-28T00:00:00.000Z
+  'SNYK-PYTHON-PARAMIKO-16425764':
+    - '*':
+        reason: >
+          Low severity cryptographic algorithm issue in paramiko@4.0.0.
+          No upgrade or patch available. Paramiko is used for remote
+          SSH operations which are not part of trestle's primary use case.
+          Accepted risk pending upstream fix.
+        expires: 2026-08-07T00:00:00.000Z
+        created: 2026-05-07T00:00:00.000Z
+patch: {}

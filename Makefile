@@ -1,0 +1,185 @@
+# -*- mode:makefile; coding:utf-8 -*-
+
+# Copyright (c) 2020 IBM Corp. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+.DEFAULT_GOAL := help
+
+# ============================================================================
+# Help
+# ============================================================================
+
+.PHONY: help
+help: ## Show this help message
+	@echo "Usage: make [target]"
+	@echo ""
+	@echo "Targets:"
+	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "  %-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@echo ""
+	@echo "For more details, see the project documentation."
+
+# ============================================================================
+# Setup
+# ============================================================================
+
+.PHONY: submodules develop pre-commit pre-commit-update
+
+submodules: ## Initialize git submodules (nist-content, oscal)
+	git submodule update --init
+
+develop: submodules ## Set up development environment
+	pip install hatch
+	pip install -e .[dev]
+
+pre-commit: ## Install pre-commit hooks
+	pre-commit install
+
+pre-commit-update: ## Update pre-commit hooks to latest versions
+	pre-commit autoupdate
+
+# ============================================================================
+# Code Quality (via hatch)
+# ============================================================================
+
+.PHONY: code-format code-lint code-lint-fix code-typing code-check mdformat
+
+code-format: ## Format code with ruff
+	hatch check fmt --fix
+
+code-lint: ## Check code style with ruff (no fixes)
+	hatch check code
+
+code-lint-fix: ## Fix code style issues with ruff
+	hatch check code --fix
+
+code-typing: ## Run mypy type checking
+	hatch run -- mypy --pretty trestle
+
+code-check: code-format code-lint code-typing ## Run all code quality checks
+
+mdformat: ## Format markdown files
+	@if ! pre-commit run mdformat --all-files; then \
+		echo "mdformat failed, cleaning cache and retrying..."; \
+		pre-commit clean; \
+		pre-commit run mdformat --all-files; \
+	fi
+
+# ============================================================================
+# Testing (via hatch test)
+# ============================================================================
+
+.PHONY: test test-all test-cov test-cov-seq test-cov-xml test-cov-xml-seq test-bdist
+
+test: ## Run tests (stops on first failure)
+	hatch test
+
+test-all: ## Run all tests in parallel
+	hatch test --all
+
+test-cov: ## Run tests with coverage report (parallel)
+	hatch test --cover
+
+test-cov-xml: test-cov ## Run tests with coverage and generate XML report (parallel)
+	hatch run coverage xml
+
+test-bdist: clean ## Test binary distribution (wheel install)
+	bash tests/manual_tests/test_binary.sh
+
+# ============================================================================
+# Build & Release
+# ============================================================================
+
+.PHONY: build release
+
+build: ## Build source and wheel distributions
+	hatch build
+
+release: ## Create a release (CI only)
+	git config --global user.name "semantic-release (via Github actions)"
+	git config --global user.email "semantic-release@github-actions"
+	semantic-release publish
+
+# ============================================================================
+# Documentation
+# ============================================================================
+
+.PHONY: docs-osx-deps docs-ubuntu-deps docs-build docs-serve docs-validate
+
+docs-osx-deps: ## Install docs dependencies on macOS
+	brew install cairo freetype libffi libjpeg libpng zlib
+
+docs-ubuntu-deps: ## Install docs dependencies on Ubuntu
+	sudo apt-get update
+	sudo apt-get -y install libcairo2-dev libfreetype6-dev libffi-dev libjpeg-dev libpng-dev libz-dev
+
+docs-build: docs-clean ## Build documentation site
+	hatch run docs:build
+
+docs-serve: docs-clean ## Serve documentation locally
+	hatch run docs:serve
+
+docs-validate: docs-clean ## Validate documentation (build + link check)
+	hatch run docs:validate
+
+docs-clean: clean-tmp
+
+# ============================================================================
+# Workflow Testing (via act + podman)
+# ============================================================================
+
+.PHONY: act-lint act-actionlint act-test-dry act-deploy-dry act-conventional-dry
+
+ACT_FLAGS := --container-architecture linux/amd64
+
+act-lint: ## Run the actionlint workflow locally with act
+	act -W .github/workflows/actionlint.yml $(ACT_FLAGS)
+
+act-actionlint: act-lint ## Alias for act-lint
+
+act-test-dry: ## Dry-run the PR test pipeline locally with act
+	act -n -W .github/workflows/python-test.yml $(ACT_FLAGS)
+
+act-deploy-dry: ## Dry-run the deploy pipeline locally with act
+	act -n -W .github/workflows/python-push.yml $(ACT_FLAGS)
+
+act-conventional-dry: ## Dry-run the conventional PR pipeline locally with act
+	act -n -W .github/workflows/conventional-pr.yml $(ACT_FLAGS)
+
+# ============================================================================
+# Utilities
+# ============================================================================
+
+.PHONY: gen-oscal simplified-catalog check-for-changes clean clean-env
+
+gen-oscal: clean-tmp ## Generate OSCAL Python models from JSON schemas
+	hatch run python ./scripts/gen_oscal.py
+
+simplified-catalog: ## Generate simplified NIST catalog for testing
+	hatch run python ./scripts/simplify_retain_ac.py ./nist-content/nist.gov/SP800-53/rev5/json/NIST_SP-800-53_rev5_catalog.json ./tests/data/json/simplified_nist_catalog.json
+
+check-for-changes: ## Check for uncommitted changes (CI)
+	hatch run docs:automation
+	git diff --exit-code
+
+clean-tmp: ## Remove tmp build artifacts and caches
+	rm -rf trestle/oscal/tmp/
+
+clean: clean-tmp ## Remove build artifacts and caches
+	rm -rf build dist .pytest_cache tmp_bin_test cov_html coverage.xml .coverage* .mypy_cache .ruff_cache site
+	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+	find . -type f -name "*.pyc" -delete 2>/dev/null || true
+	find . -type f -name "*.pyo" -delete 2>/dev/null || true
+
+clean-env: ## Remove all hatch environments (forces dependency reinstall)
+	hatch env prune

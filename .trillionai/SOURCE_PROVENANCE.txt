@@ -1,0 +1,8 @@
+Upstream: https://github.com/oscal-compass/compliance-trestle
+Upstream ref: develop
+Upstream commit: 0db78b06b7e2372e075d580fe3fc3991c4ec71f7
+Destination: Anselm04/Compliance-Trestle-Source-Code-Reference
+Original Apache-2.0 LICENSE and original file-level notices retained.
+Upstream GitHub workflows excluded to avoid untrusted CI execution.
+Upstream submodule nist-content not initialised; see .gitmodules.
+No upstream build scripts or tests executed during import.
