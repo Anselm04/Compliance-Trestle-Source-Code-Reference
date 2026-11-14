@@ -1,0 +1,14 @@
+name: Verify pinned Git source tree compliance-trestle
+on:
+  push:
+    paths:
+      - '.github/workflows/audit-source-once.yml'
+permissions:
+  contents: write
+jobs:
+  audit:
+    uses: Anselm04/Macro-source-code-reference-/.github/workflows/reusable-source-audit.yml@main
+    with:
+      upstream_url: https://github.com/oscal-compass/compliance-trestle.git
+      upstream_sha: 0db78b06b7e2372e075d580fe3fc3991c4ec71f7
+      audit_slug: compliance-trestle
