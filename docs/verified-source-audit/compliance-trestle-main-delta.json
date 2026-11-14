@@ -1,9 +1,9 @@
 {
   "upstream": "https://github.com/oscal-compass/compliance-trestle.git",
   "pinned_commit": "0db78b06b7e2372e075d580fe3fc3991c4ec71f7",
-  "destination_main_sha": "7cfecd049a33b8f847ccf88b8c7f81247c3ab941",
+  "destination_main_sha": "09e9ad137cf89e74ae3c9706e8df1105ec684b23",
   "upstream_tracked_entries": 1574,
-  "destination_tracked_entries": 1565,
+  "destination_tracked_entries": 1569,
   "missing_paths": [
     ".github/workflows/act-test.yml",
     ".github/workflows/actionlint.yml",
@@ -15,18 +15,20 @@
     ".github/workflows/python-test.yml",
     ".github/workflows/scorecard.yml",
     ".github/workflows/stale.yml",
-    ".github/workflows/verify-signoff.yml",
-    "nist-content"
+    ".github/workflows/verify-signoff.yml"
   ],
-  "missing_path_count": 12,
+  "missing_path_count": 11,
   "missing_upstream_ci_count": 11,
-  "missing_other_count": 1,
+  "missing_other_count": 0,
   "mismatched_objects": [],
   "mismatched_count": 0,
   "extra_paths": [
     ".github/workflows/audit-source-once.yml",
     ".trillionai/FILE_COUNT.txt",
-    ".trillionai/SOURCE_PROVENANCE.txt"
+    ".trillionai/SOURCE_COMPLETENESS_REPAIR.md",
+    ".trillionai/SOURCE_PROVENANCE.txt",
+    "docs/verified-source-audit/compliance-trestle-main-delta.json",
+    "docs/verified-source-audit/compliance-trestle-summary.md"
   ],
-  "extra_count": 3
+  "extra_count": 6
 }
