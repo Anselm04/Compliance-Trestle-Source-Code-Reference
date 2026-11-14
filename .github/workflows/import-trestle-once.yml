@@ -1,0 +1,46 @@
+name: One-time import of Compliance Trestle reference source
+on:
+  push:
+    paths:
+      - '.github/workflows/import-trestle-once.yml'
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout destination
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Archive authentic upstream source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch develop https://github.com/oscal-compass/compliance-trestle.git /tmp/compliance-trestle
+          UPSTREAM_SHA="$(git -C /tmp/compliance-trestle rev-parse HEAD)"
+          mkdir -p .trillionai
+          rsync -a --exclude='.git' --exclude='.github/workflows' /tmp/compliance-trestle/ ./
+          printf '%s\n' \
+            "Upstream: https://github.com/oscal-compass/compliance-trestle" \
+            "Upstream ref: develop" \
+            "Upstream commit: ${UPSTREAM_SHA}" \
+            "Destination: Anselm04/Compliance-Trestle-Source-Code-Reference" \
+            "Original Apache-2.0 LICENSE and original file-level notices retained." \
+            "Upstream GitHub workflows excluded to avoid untrusted CI execution." \
+            "Upstream submodule nist-content not initialised; see .gitmodules." \
+            "No upstream build scripts or tests executed during import." > .trillionai/SOURCE_PROVENANCE.txt
+          test -f LICENSE
+          test -f pyproject.toml
+          test -d trestle
+          rm .github/workflows/import-trestle-once.yml
+          git add -A
+          FILES="$(git ls-files | wc -l | tr -d ' ')"
+          printf 'Tracked files after source import (including this record): %s\n' "$((FILES+1))" > .trillionai/FILE_COUNT.txt
+          printf 'Upstream commit: %s\n' "${UPSTREAM_SHA}" >> .trillionai/FILE_COUNT.txt
+          git add .trillionai/FILE_COUNT.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "archive: import Compliance Trestle source with licence, provenance and file count"
+          git push origin HEAD:main
