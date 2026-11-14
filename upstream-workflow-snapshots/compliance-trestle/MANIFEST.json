@@ -1,0 +1,74 @@
+{
+  "source": "https://github.com/oscal-compass/compliance-trestle.git",
+  "commit": "0db78b06b7e2372e075d580fe3fc3991c4ec71f7",
+  "number_of_original_workflow_files": 11,
+  "original_ci_is_disabled": true,
+  "files": [
+    {
+      "upstream_path": ".github/workflows/act-test.yml",
+      "reference_path": "upstream-workflow-snapshots/compliance-trestle/.github/workflows/act-test.yml",
+      "git_blob": "689b7a4b162a43af7cb5eea96404c26eee00560d",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/actionlint.yml",
+      "reference_path": "upstream-workflow-snapshots/compliance-trestle/.github/workflows/actionlint.yml",
+      "git_blob": "96c22f55075ad707b6704ed7eed8b5d3caf992e6",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/codeql-analysis.yml",
+      "reference_path": "upstream-workflow-snapshots/compliance-trestle/.github/workflows/codeql-analysis.yml",
+      "git_blob": "9be2cd1e20e3f3e9e9ef53be9f1a16462e27950c",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/conventional-pr.yml",
+      "reference_path": "upstream-workflow-snapshots/compliance-trestle/.github/workflows/conventional-pr.yml",
+      "git_blob": "8d3a0827556833196da5c55a85a2aa3a1a42ccba",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/docs-update.yml",
+      "reference_path": "upstream-workflow-snapshots/compliance-trestle/.github/workflows/docs-update.yml",
+      "git_blob": "febd384f6a9c0929f2de61c1fe15d5f7ecf8d70e",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/fuzz.yml",
+      "reference_path": "upstream-workflow-snapshots/compliance-trestle/.github/workflows/fuzz.yml",
+      "git_blob": "5718c9da63e5142f1c2d1aa9d8921c226cc54140",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/python-push.yml",
+      "reference_path": "upstream-workflow-snapshots/compliance-trestle/.github/workflows/python-push.yml",
+      "git_blob": "bd20e969a68d76979e6b24932e506d4ace505552",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/python-test.yml",
+      "reference_path": "upstream-workflow-snapshots/compliance-trestle/.github/workflows/python-test.yml",
+      "git_blob": "d9604c617e9294810aa4f81e4ebdd48496c22c42",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/scorecard.yml",
+      "reference_path": "upstream-workflow-snapshots/compliance-trestle/.github/workflows/scorecard.yml",
+      "git_blob": "0783ddbfaf73115715c7848be1fabdad5aee70fe",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/stale.yml",
+      "reference_path": "upstream-workflow-snapshots/compliance-trestle/.github/workflows/stale.yml",
+      "git_blob": "a67eea0005b4a15da3a19a1c04356427141eb088",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/verify-signoff.yml",
+      "reference_path": "upstream-workflow-snapshots/compliance-trestle/.github/workflows/verify-signoff.yml",
+      "git_blob": "b7a7bdde821e2a5061916c028dcbb88d4a804ac7",
+      "original_mode": "100644"
+    }
+  ]
+}

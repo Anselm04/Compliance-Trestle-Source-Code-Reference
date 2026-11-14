@@ -1,0 +1,310 @@
+# This workflow will install Python dependencies, run tests and lint with a variety of Python versions
+# For more information see: https://help.github.com/actions/language-and-framework-guides/using-python-with-github-actions
+name: Trestle PR pipeline
+on:
+  pull_request:
+  push:
+    branches:
+      - develop
+permissions: read-all
+jobs:
+  set-versions:
+    runs-on: ubuntu-latest
+    outputs:
+      min: ${{ steps.versions.outputs.min }}
+      max: ${{ steps.versions.outputs.max }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - id: versions
+      run: |
+        min_version=$(jq '.PYTHON_MIN' -r version.json)
+        max_version=$(jq '.PYTHON_MAX' -r version.json)
+        echo "min=$min_version" >> $GITHUB_OUTPUT
+        echo "max=$max_version" >> $GITHUB_OUTPUT
+  lint:
+    needs: set-versions
+    runs-on: ubuntu-latest
+    steps:
+    - name: Don't mess with line endings
+      run: |
+        git config --global core.autocrlf false
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        submodules: true
+        fetch-depth: 0
+    - name: Set up Python
+      uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      with:
+        python-version: ${{ needs.set-versions.outputs.max }}
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cache/pip
+          ~/.cache/hatch
+          ~/.local/share/hatch
+        key: ubuntu-latest-${{ needs.set-versions.outputs.max }}-hatch-${{ hashFiles('pyproject.toml') }}
+        restore-keys: |
+          ubuntu-latest-${{ needs.set-versions.outputs.max }}-hatch-
+    - name: Install tools
+      run: |
+        make develop
+    - name: Setup pre-commit
+      run: |
+        make pre-commit
+    - name: Run md document formatting (mdformat)
+      run: |
+        make mdformat
+    - name: Run code formatting (ruff)
+      run: |
+        make code-format
+    - name: Run code linting (ruff)
+      run: |
+        make code-lint
+    - name: Run code typing check (mypy)
+      continue-on-error: true
+      run: |
+        make code-typing
+    - name: Install documentation dependencies
+      run: |
+        make docs-ubuntu-deps
+    - name: Validate website content (mkdocs)
+      env:
+        NO_MKDOCS_2_WARNING: '1'
+      run: |
+        make docs-validate
+    - name: Check if dirty (mkdocs)
+      env:
+        NO_MKDOCS_2_WARNING: '1'
+      run: |
+        make check-for-changes
+
+# This test simulates what it is like for a user to install trestle today.
+# Coverage cannot be calculated as part of
+  bdist:
+    needs: set-versions
+    runs-on: ubuntu-latest
+    steps:
+    - name: Don't mess with line endings
+      run: |
+        git config --global core.autocrlf false
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        submodules: true
+    - name: Set up Python
+      uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      with:
+        python-version: ${{ needs.set-versions.outputs.max }}
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cache/pip
+          ~/.cache/hatch
+          ~/.local/share/hatch
+        key: ubuntu-latest-${{ needs.set-versions.outputs.max }}-hatch-${{ hashFiles('pyproject.toml') }}
+        restore-keys: |
+          ubuntu-latest-${{ needs.set-versions.outputs.max }}-hatch-
+    - name: Install hatch
+      run: |
+        pip install hatch "virtualenv>=21"
+    - name: Run binary tests
+      run: |
+        make test-bdist
+
+  test-with-codegen:
+    needs: set-versions
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        python-version: [ '${{ needs.set-versions.outputs.max }}' ]
+        include:
+        - os: ubuntu-latest
+          pip-cache: ~/.cache/pip
+          hatch-cache: ~/.cache/hatch
+          hatch-data: ~/.local/share/hatch
+    steps:
+    - name: Don't mess with line endings
+      run: |
+        git config --global core.autocrlf false
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+        submodules: true
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      with:
+        python-version: ${{ matrix.python-version }}
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ${{ matrix.pip-cache }}
+          ${{ matrix.hatch-cache }}
+          ${{ matrix.hatch-data }}
+        key: ${{ matrix.os }}-${{ matrix.python-version }}-hatch-${{ hashFiles('pyproject.toml') }}
+        restore-keys: |
+          ${{ matrix.os }}-${{ matrix.python-version }}-hatch-
+    - name: Install hatch
+      run: |
+        make develop
+    - name: Recreate hatch test environment
+      shell: bash
+      run: |
+        hatch env remove hatch-test.py${{ matrix.python-version }} 2>/dev/null || true
+        hatch env create hatch-test.py${{ matrix.python-version }}
+    - name: gen OSCAL models
+      run: |
+        make gen-oscal
+    - name: Run tests
+      run: |
+        make test
+  test:
+    # This test
+    needs: set-versions
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: [ '${{ needs.set-versions.outputs.min }}', '${{ needs.set-versions.outputs.max }}' ]
+        include:
+        - os: ubuntu-latest
+          pip-cache: ~/.cache/pip
+          hatch-cache: ~/.cache/hatch
+          hatch-data: ~/.local/share/hatch
+        - os: macos-latest
+          pip-cache: ~/Library/Caches/pip
+          hatch-cache: ~/Library/Caches/hatch
+          hatch-data: ~/Library/Application Support/hatch
+        - os: windows-latest
+          pip-cache: ~\AppData\Local\pip\Cache
+          hatch-cache: ~\AppData\Local\hatch\Cache
+          hatch-data: ~\AppData\Local\hatch
+    steps:
+    - name: Don't mess with line endings
+      run: |
+        git config --global core.autocrlf false
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+        submodules: true
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      with:
+        python-version: ${{ matrix.python-version }}
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ${{ matrix.pip-cache }}
+          ${{ matrix.hatch-cache }}
+          ${{ matrix.hatch-data }}
+        key: ${{ matrix.os }}-${{ matrix.python-version }}-hatch-${{ hashFiles('pyproject.toml') }}
+        restore-keys: |
+          ${{ matrix.os }}-${{ matrix.python-version }}-hatch-
+    - name: Is core test version
+      id: core-version
+      run: echo "core=${{ (matrix.os == 'ubuntu-latest' && matrix.python-version == needs.set-versions.outputs.max ) }}" >> $GITHUB_OUTPUT
+    - name: Install hatch
+      run: |
+        pip install hatch "virtualenv>=21"
+    - name: Recreate hatch test environment
+      shell: bash
+      run: |
+        hatch env remove hatch-test.py${{ matrix.python-version }} 2>/dev/null || true
+        hatch env create hatch-test.py${{ matrix.python-version }}
+    - name: Run tests
+      if: steps.core-version.outputs.core != 'true'
+      run: |
+        hatch test -py ${{ matrix.python-version }}
+    - name: Run tests with coverage
+      if: steps.core-version.outputs.core == 'true'
+      run: |
+        hatch test --cover -py ${{ matrix.python-version }}
+    - name: Generate coverage report
+      if: steps.core-version.outputs.core == 'true'
+      run: |
+        pip install coverage
+        coverage xml
+
+    - name: Upload artifact
+      if: steps.core-version.outputs.core == 'true'
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: coverage
+        path: coverage.xml
+
+  sonar:
+    if: ${{ (github.event.pull_request.base.repo.url == github.event.pull_request.head.repo.url && github.triggering_actor != 'dependabot[bot]' ) }}
+    runs-on: ubuntu-latest
+    needs: [ test, set-versions]
+    steps:
+    - name: Don't mess with line endings
+      run: |
+        git config --global core.autocrlf false
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        submodules: true
+    - name: Set up Python
+      uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      with:
+        python-version: ${{ needs.set-versions.outputs.max }}
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cache/pip
+          ~/.cache/hatch
+          ~/.local/share/hatch
+        key: ubuntu-latest-${{ needs.set-versions.outputs.max }}-hatch-${{ hashFiles('pyproject.toml') }}
+        restore-keys: |
+          ubuntu-latest-${{ needs.set-versions.outputs.max }}-hatch-
+    - name: Get coverage
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: coverage
+    - name: SonarQube Scan
+      uses: SonarSource/sonarqube-scan-action@e805d875275f728fac1885b413934be6d7c63f65 # v8.4.1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # Needed to get PR information, if any
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      with:
+        args: >
+          -Dsonar.python.coverage.reportPaths=coverage.xml
+          -Dsonar.tests=tests/
+          -Dsonar.sources=trestle/ 
+          -Dsonar.python.version=${{ needs.set-versions.outputs.max }}
+          -Dsonar.projectKey=compliance-trestle
+          -Dsonar.organization=compliance-trestle
+          -Dsonar.cpd.exclusions=trestle/oscal/*.py
+          -Dsonar.exclusions=trestle/oscal/*.py
+    - name: SonarQube Quality Gate check
+      uses: sonarsource/sonarqube-quality-gate-action@df914238f99aa5d81f4490aeea80f205c7ed9600 # master
+      # Force to fail step after specific time
+      timeout-minutes: 5
+      env:
+       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  snyk:
+    if: ${{ (github.event.pull_request.base.repo.url == github.event.pull_request.head.repo.url && github.triggering_actor != 'dependabot[bot]' ) }}
+    runs-on: ubuntu-latest
+    needs: [ set-versions ]
+    steps:
+      - name: Don't mess with line endings
+        run: |
+          git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ needs.set-versions.outputs.max }}
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/hatch
+            ~/.local/share/hatch
+          key: ubuntu-latest-${{ needs.set-versions.outputs.max }}-hatch-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ubuntu-latest-${{ needs.set-versions.outputs.max }}-hatch-
+      - uses: ./.github/actions/snyk-test
+        with:
+          token: ${{ secrets.SNYK_TOKEN }}
